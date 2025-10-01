@@ -1,4 +1,4 @@
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import math
 import numpy as np
 from osgeo import gdal
@@ -7,8 +7,15 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-plt.style.use('seaborn-v0_8')
+# plt.style.use('seaborn-v0_8')
 gdal.UseExceptions()
+
+WATER_SURFACE_TAG = 5
+ICE_TAG = 1
+BATHYMETRY_TAG = 2
+INFLOW_TAG = 4
+INFLOW_LINE_TAG = 3
+SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
 
 def readraster(filename):
     raster = gdal.Open(filename)
@@ -136,17 +143,17 @@ def plot_main_geoline(shoreline):
         X.append(coord[0])
         Y.append(coord[1])
     
-    plt.figure(figsize=(5, 5))
-    plt.scatter(X, Y)
-    ax = plt.gca()
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlabel('Meters')
-    ax.set_ylabel('Meters')
-    plt.draw()
+    # plt.figure(figsize=(5, 5))
+    # plt.scatter(X, Y)
+    # ax = plt.gca()
+    # ax.set_aspect('equal', adjustable='box')
+    # ax.set_xlabel('Meters')
+    # ax.set_ylabel('Meters')
+    # plt.draw()
     
 def plot_full_outline(lines):
     
-    plt.figure(figsize=(6,8))
+    # plt.figure(figsize=(6,8))
     
     for line in lines.keys():
         X = []
@@ -154,17 +161,17 @@ def plot_full_outline(lines):
         for coord in lines[line]:
             X.append(coord[0])
             Y.append(coord[1])
-        plt.plot(X, Y, marker = 'o', markersize = 5, linestyle = '--', label=line)
+        # plt.plot(X, Y, marker = 'o', markersize = 5, linestyle = '--', label=line)
         
-    ax = plt.gca()
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlabel('$x$ (m)', fontsize = 12)
-    ax.set_ylabel('$y$ (m)', fontsize = 12)
-    plt.title("Outline Boundary Points",
-              fontsize = 14)
-    plt.legend(loc="best", frameon = True, facecolor = "white", edgecolor = "black", 
-               fontsize=8)
-    plt.draw()
+    # ax = plt.gca()
+    # ax.set_aspect('equal', adjustable='box')
+    # ax.set_xlabel('$x$ (m)', fontsize = 12)
+    # ax.set_ylabel('$y$ (m)', fontsize = 12)
+    # plt.title("Outline Boundary Points",
+            #   fontsize = 14)
+    # plt.legend(loc="best", frameon = True, facecolor = "white", edgecolor = "black", 
+            #    fontsize=8)
+    # plt.draw()
         
 
 def check_if_inflow(point, category_array, category_trans):
@@ -507,11 +514,11 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     
     all_inflow_lines = [tag for dim, tag in all_inflow_lines]
     
-    model.geo.addPhysicalGroup(2, [surface1], tag=1, name="Water Surface")
-    model.geo.addPhysicalGroup(2, ice, tag=2, name="Ice")
-    model.geo.addPhysicalGroup(2, bath, tag=3, name="Bathymetry")
-    model.geo.addPhysicalGroup(2, inflow, tag=4, name="Inflow")
-    model.geo.addPhysicalGroup(1, all_inflow_lines, tag=12, name="Inflow lines")
+    model.geo.addPhysicalGroup(2, [surface1], tag=WATER_SURFACE_TAG, name="Water Surface")
+    model.geo.addPhysicalGroup(2, ice, tag=ICE_TAG, name="Ice")
+    model.geo.addPhysicalGroup(2, bath, tag=BATHYMETRY_TAG, name="Bathymetry")
+    model.geo.addPhysicalGroup(2, inflow, tag=INFLOW_TAG, name="Inflow")
+    model.geo.addPhysicalGroup(1, all_inflow_lines, tag=INFLOW_LINE_TAG, name="Inflow lines")
 
     if num_of_layers > 2:
         model.geo.addPhysicalGroup(2, mid_layers, tag=6, name="Mid")
@@ -605,10 +612,10 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     thickness_trans = thickness_data.GetGeoTransform()
     surface_pos_array = surface_pos_data.ReadAsArray()
     
-    bathymetry_node_tags, bathymetry_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 3)
-    surface_node_tags, surface_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 1)
-    ice_node_tags, ice_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 2)
-    inflow_node_tags, inflow_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 4)
+    bathymetry_node_tags, bathymetry_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, BATHYMETRY_TAG)
+    surface_node_tags, surface_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, WATER_SURFACE_TAG)
+    ice_node_tags, ice_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, ICE_TAG)
+    inflow_node_tags, inflow_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, INFLOW_TAG)
     
     bathymetry_node_coords = bathymetry_node_coords.reshape((bathymetry_node_tags.size, 3))
     surface_node_coords = surface_node_coords.reshape((surface_node_tags.size, 3))
@@ -691,9 +698,9 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     if num_of_layers == 2:
         
-        inflow_ents = gmsh.model.getEntitiesForPhysicalGroup(2, 4)
-        model.geo.removePhysicalGroups([(2,4)])
-        model.geo.removePhysicalGroups([(1,12)])
+        inflow_ents = gmsh.model.getEntitiesForPhysicalGroup(2, INFLOW_TAG)
+        model.geo.removePhysicalGroups([(2, INFLOW_TAG)])
+        model.geo.removePhysicalGroups([(1, INFLOW_LINE_TAG)])
         new_inflow = []
         
         copied_inflow_data = []
@@ -776,15 +783,15 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             for surface in inflow_stack_points.keys():
                 model.mesh.embed(0, inflow_stack_points[surface], 2, surface)
 
-        model.geo.addPhysicalGroup(2, new_inflow, tag=4, name="Inflow")
+        model.geo.addPhysicalGroup(2, new_inflow, tag=INFLOW_TAG, name="Inflow")
         
         gmsh.model.geo.synchronize()
         model.mesh.generate(2)
         gmsh.model.geo.synchronize()
         
         surf_tags = []
-        for i in range(1, 5):
-            surf_tags = surf_tags + [tag for tag in model.getEntitiesForPhysicalGroup(2, i)]
+        for group_tag in SURFACE_PHYSICAL_TAGS:
+            surf_tags.extend(model.getEntitiesForPhysicalGroup(2, group_tag))
 
         surf_loop = gmsh.model.geo.addSurfaceLoop(surf_tags)
         vol = gmsh.model.geo.addVolume([surf_loop])
@@ -798,12 +805,12 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             gmsh.model.geo.addPhysicalGroup(3, [vol], 5, name='Water')
     
     else:
-        model.geo.removePhysicalGroups([(1,12)])
+        model.geo.removePhysicalGroups([(1, INFLOW_LINE_TAG)])
         gmsh.model.geo.synchronize()
         
         if scale > 1:
-            inflow_ents = gmsh.model.getEntitiesForPhysicalGroup(2, 4)
-            model.geo.removePhysicalGroups([(2,4)])
+            inflow_ents = gmsh.model.getEntitiesForPhysicalGroup(2, INFLOW_TAG)
+            model.geo.removePhysicalGroups([(2, INFLOW_TAG)])
             new_inflow = []
             
             copied_inflow_data = []
@@ -831,15 +838,15 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             
             gmsh.model.geo.synchronize()
 
-            model.geo.addPhysicalGroup(2, new_inflow, tag=4, name="Inflow")
+            model.geo.addPhysicalGroup(2, new_inflow, tag=INFLOW_TAG, name="Inflow")
             
             gmsh.model.geo.synchronize()
             model.mesh.generate(2)
             gmsh.model.geo.synchronize()
         
         surf_tags = []
-        for i in range(1, 5):
-            surf_tags = surf_tags + [tag for tag in model.getEntitiesForPhysicalGroup(2, i)]
+        for group_tag in SURFACE_PHYSICAL_TAGS:
+            surf_tags.extend(model.getEntitiesForPhysicalGroup(2, group_tag))
 
         surf_loop = gmsh.model.geo.addSurfaceLoop(surf_tags)
         vol = gmsh.model.geo.addVolume([surf_loop])
@@ -910,9 +917,9 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     model.mesh.reclassifyNodes()
     model.geo.synchronize()
     
-    surface_node_tags, surface_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 1)
-    ice_node_tags, ice_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 2)
-    bath_node_tags, bath_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, 3)
+    surface_node_tags, surface_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, WATER_SURFACE_TAG)
+    ice_node_tags, ice_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, ICE_TAG)
+    bath_node_tags, bath_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, BATHYMETRY_TAG)
     water_node_tags, water_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(3, 5)
     
     ice_node_coords = ice_node_coords.reshape((ice_node_tags.size, 3))
@@ -950,7 +957,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     return dof, meshname
 
 def main():
-    elevation = readraster('../data/gis_data/elevation.tif')
+    elevation = readraster('../data/gis_data/bathymetry.tif')
     elevation_band = elevation.GetRasterBand(1)
 
     SR = osr.SpatialReference(elevation.GetProjection())
