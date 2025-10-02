@@ -1,0 +1,9 @@
+*.msh
+*.tif
+*.tiff
+*.pyc
+*.geojson
+*.h5
+*.xdmf
+*.DS_Store
+*outline*

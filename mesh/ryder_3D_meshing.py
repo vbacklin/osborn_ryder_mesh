@@ -1167,7 +1167,7 @@ def main():
         Scenario(410, 39, 13, False, False, 0),
     ]
     
-    params = unstructured#combo_test
+    params = stacked#combo_test
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
