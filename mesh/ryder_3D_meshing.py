@@ -7,6 +7,7 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
+from typing import NamedTuple
 # plt.style.use('seaborn-v0_8')
 gdal.UseExceptions()
 
@@ -1068,63 +1069,113 @@ def main():
     
     dofs = []
     
+    class Scenario(NamedTuple):
+        element_size: float
+        scale: float
+        num_layers: int
+        adapt: bool
+        optimize: bool
+        stack: float
+
     #Unstructured:
-    unstructured = [(400, 1, 2, False, False, 0), (300, 1, 2, False, False, 0), 
-                    (250, 1, 2, False, False, 0), (200, 1, 2, False, False, 0), 
-                    (160, 1, 2, False, False, 0)]
+    unstructured = [
+        Scenario(400, 1, 2, False, False, 0),
+        Scenario(300, 1, 2, False, False, 0),
+        Scenario(250, 1, 2, False, False, 0),
+        Scenario(200, 1, 2, False, False, 0),
+        Scenario(160, 1, 2, False, False, 0),
+    ]
     #Scaled DOF-test 200m:
     
-    scaled_200_dofs = [(200, 2, 2, False, False, 0), (200, 3, 2, False, False, 0), 
-                       (200, 4, 2, False, False, 0), (200, 5, 2, False, False, 0), 
-                       (200, 6, 2, False, False, 0), (200, 7, 2, False, False, 0),
-                       (200, 8, 2, False, False, 0), (200, 9, 2, False, False, 0),
-                       (200, 10, 2, False, False, 0), (200, 11, 2, False, False, 0),
-                       (200, 12, 2, False, False, 0), (200, 13, 2, False, False, 0),
-                       (200, 14, 2, False, False, 0), (200, 15, 2, False, False, 0)]
+    scaled_200_dofs = [
+        Scenario(200, 2, 2, False, False, 0),
+        Scenario(200, 3, 2, False, False, 0),
+        Scenario(200, 4, 2, False, False, 0),
+        Scenario(200, 5, 2, False, False, 0),
+        Scenario(200, 6, 2, False, False, 0),
+        Scenario(200, 7, 2, False, False, 0),
+        Scenario(200, 8, 2, False, False, 0),
+        Scenario(200, 9, 2, False, False, 0),
+        Scenario(200, 10, 2, False, False, 0),
+        Scenario(200, 11, 2, False, False, 0),
+        Scenario(200, 12, 2, False, False, 0),
+        Scenario(200, 13, 2, False, False, 0),
+        Scenario(200, 14, 2, False, False, 0),
+        Scenario(200, 15, 2, False, False, 0),
+    ]
 
     #Scaled DOF-test 220m:
     
-    scaled_220_dofs = [(220, 2, 2, False, False, 0), (220, 3, 2, False, False, 0), 
-                       (220, 4, 2, False, False, 0), (220, 5, 2, False, False, 0), 
-                       (220, 6, 2, False, False, 0), (220, 7, 2, False, False, 0),
-                       (220, 8, 2, False, False, 0), (220, 9, 2, False, False, 0),
-                       (220, 10, 2, False, False, 0), (220, 11, 2, False, False, 0),
-                       (220, 12, 2, False, False, 0), (220, 13, 2, False, False, 0),
-                       (220, 14, 2, False, False, 0), (220, 15, 2, False, False, 0)]
+    scaled_220_dofs = [
+        Scenario(220, 2, 2, False, False, 0),
+        Scenario(220, 3, 2, False, False, 0),
+        Scenario(220, 4, 2, False, False, 0),
+        Scenario(220, 5, 2, False, False, 0),
+        Scenario(220, 6, 2, False, False, 0),
+        Scenario(220, 7, 2, False, False, 0),
+        Scenario(220, 8, 2, False, False, 0),
+        Scenario(220, 9, 2, False, False, 0),
+        Scenario(220, 10, 2, False, False, 0),
+        Scenario(220, 11, 2, False, False, 0),
+        Scenario(220, 12, 2, False, False, 0),
+        Scenario(220, 13, 2, False, False, 0),
+        Scenario(220, 14, 2, False, False, 0),
+        Scenario(220, 15, 2, False, False, 0),
+    ]
     
     #Scaled:
     
-    scaled = [(220, 6, 2, False, False, 0), (220, 6, 2, False, True, 0), 
-              (200, 11, 2, False, False, 0), (200, 6, 2, False, True, 0)]
+    scaled = [
+        Scenario(220, 6, 2, False, False, 0),
+        Scenario(220, 6, 2, False, True, 0),
+        Scenario(200, 11, 2, False, False, 0),
+        Scenario(200, 6, 2, False, True, 0),
+    ]
     
     #Layered:
     
-    layered = [(295, 1, 9, False, False, 0), (340, 1, 12, False, False, 0), 
-               (410, 1, 16, False, False, 0), (450, 1, 20, False, False, 0)]
+    layered = [
+        Scenario(295, 1, 9, False, False, 0),
+        Scenario(340, 1, 12, False, False, 0),
+        Scenario(410, 1, 16, False, False, 0),
+        Scenario(450, 1, 20, False, False, 0),
+    ]
     
     #Stacked:
      
-    stacked = [(730, 1, 2, False, False, 10), (560, 1, 2, False, False, 15), 
-               (480, 1, 2, False, False, 20), (450, 1, 2, False, False, 25), 
-               (310, 1, 2, False, False, 50), (255, 1, 2, False, False, 75)]
+    stacked = [
+        Scenario(730, 1, 2, False, False, 10),
+        Scenario(560, 1, 2, False, False, 15),
+        Scenario(480, 1, 2, False, False, 20),
+        Scenario(450, 1, 2, False, False, 25),
+        Scenario(310, 1, 2, False, False, 50),
+        Scenario(255, 1, 2, False, False, 75),
+    ]
     
     #Adaptive:
-    adaptive = [(560, 1, 2, True, False, 10), (470, 1, 2, True, False, 15), 
-                (400, 1, 2, True, False, 20), (460, 1, 20, True, False, 0),
-                (190, 6, 2, True, False, 0)]
+    adaptive = [
+        Scenario(560, 1, 2, True, False, 10),
+        Scenario(470, 1, 2, True, False, 15),
+        Scenario(400, 1, 2, True, False, 20),
+        Scenario(460, 1, 20, True, False, 0),
+        Scenario(190, 6, 2, True, False, 0),
+    ]
     
     #Combo test:
-    combo_test = [(295, 11, 5, False, False, 0), (410, 39, 13, False, False, 0)]     
+    combo_test = [
+        Scenario(295, 11, 5, False, False, 0),
+        Scenario(410, 39, 13, False, False, 0),
+    ]
     
-    params = combo_test
+    params = unstructured#combo_test
     
-    for m, scale, num_of_layers, adapt, opt, stack in params:
+    for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 m, -1, categories, full_bathymetry, highres, 
-                                 thickness_data, surface_pos_data, scale = scale, 
-                                 num_of_layers = num_of_layers, adapt = adapt, 
-                                 adaptive_scales = (1/4, 2), optimize = opt, 
-                                 stack = stack, interpolate = True)
+                                 scenario.element_size, -1, categories, full_bathymetry, highres, 
+                                 thickness_data, surface_pos_data, scale = scenario.scale, 
+                                 num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
+                                 adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
+                                 stack = scenario.stack, interpolate = True)
         dofs.append((meshname, dof))
     
     for meshname, dof in dofs:
