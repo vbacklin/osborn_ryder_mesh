@@ -16,6 +16,14 @@ BATHYMETRY_TAG = 2
 INFLOW_TAG = 4
 INFLOW_LINE_TAG = 3
 SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
+ROTATE_X_DEGREES = 90
+ROTATE_Y_DEGREES = -116
+ROTATE_X_RAD = math.radians(ROTATE_X_DEGREES)
+ROTATE_Y_RAD = math.radians(ROTATE_Y_DEGREES)
+ROTATE_X_COS = math.cos(ROTATE_X_RAD)
+ROTATE_X_SIN = math.sin(ROTATE_X_RAD)
+ROTATE_Y_COS = math.cos(ROTATE_Y_RAD)
+ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
 
 def readraster(filename):
     raster = gdal.Open(filename)
@@ -61,6 +69,18 @@ def point_in_set(point, line, tol=1e-6):
         if abs(px - x) < tol and abs(py - y) < tol:
             return True
     return False
+
+def rotate_coordinates(x, y, z):
+    """Rotate a point around the configured x- then y-axis angles."""
+    x_after_x = x
+    y_after_x = y * ROTATE_X_COS - z * ROTATE_X_SIN
+    z_after_x = y * ROTATE_X_SIN + z * ROTATE_X_COS
+
+    x_after_y = x_after_x * ROTATE_Y_COS + z_after_x * ROTATE_Y_SIN
+    y_after_y = y_after_x
+    z_after_y = -x_after_x * ROTATE_Y_SIN + z_after_x * ROTATE_Y_COS
+
+    return x_after_y, y_after_y, z_after_y
 
 def get_grounding_line(seaice, landice):
     grounding_line = []
@@ -928,19 +948,33 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     xmin = min(water_node_coords[:,0])
     ymin = min(water_node_coords[:,1])
     
-    i = 0
     print(meshname)
-    
-    for tag in water_node_tags:
-        x = water_node_coords[i][0]
-        y = water_node_coords[i][1]
-        z = water_node_coords[i][2]
+
+    rotated_nodes = []
+    min_rot_x = float("inf")
+    min_rot_y = float("inf")
+
+    for idx, tag in enumerate(water_node_tags):
+        x = water_node_coords[idx][0]
+        y = water_node_coords[idx][1]
+        z = water_node_coords[idx][2]
         if ((tag not in surface_node_tags) and 
-            (not point_in_set((x,y), xy_shoreline))):
-            gmsh.model.mesh.setNode(tag, [x - xmin, y - ymin, z/scale], [])
-        else:
-            gmsh.model.mesh.setNode(tag, [x - xmin, y - ymin, z], [])
-        i += 1
+            (not point_in_set((x, y), xy_shoreline))):
+            z = z/scale
+        x_translated = x - xmin
+        y_translated = y - ymin
+        x_rot, y_rot, z_rot = rotate_coordinates(x_translated, y_translated, z)
+        rotated_nodes.append((tag, x_rot, y_rot, z_rot))
+        if x_rot < min_rot_x:
+            min_rot_x = x_rot
+        if y_rot < min_rot_y:
+            min_rot_y = y_rot
+
+    if rotated_nodes:
+        shift_x = -min_rot_x
+        shift_y = -min_rot_y
+        for tag, x_rot, y_rot, z_rot in rotated_nodes:
+            gmsh.model.mesh.setNode(tag, [x_rot + shift_x, y_rot + shift_y, z_rot], [])
     
     model.geo.synchronize()
     
