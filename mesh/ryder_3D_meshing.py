@@ -27,6 +27,12 @@ ROTATE_Y_COS = math.cos(ROTATE_Y_RAD)
 ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
 
 def readraster(filename):
+    """Load a raster with GDAL and write a working copy next to our scripts.
+
+    The original geotiffs are kept immutable.  Creating a copy in
+    `mesh/new_data/` lets us freely modify metadata (projections, footprints
+    etc.) without touching the source dataset the user provided.
+    """
     raster = gdal.Open(filename)
     driver = raster.GetDriver()
     copy_name_list = filename.split('.')
@@ -36,10 +42,12 @@ def readraster(filename):
     return raster_copy
 
 def readvector(filename):
+    """Helper around GDAL/OGR to read vector layers such as shorelines."""
     vector = gdal.OpenEx(filename)
     return vector
 
 def get_boundary_string(filename):
+    """Return the WKT string describing the boundary of the first layer."""
     border = readvector(filename)
     layer = border.GetLayer()
     feature = layer.GetFeature(0)
@@ -48,9 +56,20 @@ def get_boundary_string(filename):
     return boundary
     
 def get_main_boundary(boundary, no=0):
+    """Pick one polyline from a MULTILINESTRING boundary description.
+
+    Parameters
+    ----------
+    boundary: str
+        WKT string (typically MULTILINESTRING) returned by GDAL.
+    no: int
+        Which curve to pick after sorting by length.  By default we take the
+        outermost shoreline (the longest curve).
+    """
     boundary = boundary.replace('MULTILINESTRING ','')
     curves = boundary.split(')')
     if no == 0:
+        # The outer boundary is the longest polyline in the WKT description.
         main_boundary = max(curves, key=len) #Check for longest curve <- outer boundary
         main_boundary = main_boundary.strip(',(')
     else:
@@ -64,6 +83,7 @@ def get_main_boundary(boundary, no=0):
     return coords
 
 def point_in_set(point, line, tol=1e-6):
+    """Return True if `point` already exists (within `tol`) in `line`."""
     
     px, py = point
     for (x, y) in line:
@@ -72,7 +92,13 @@ def point_in_set(point, line, tol=1e-6):
     return False
 
 def rotate_coordinates(x, y, z):
-    """Rotate a point around the configured x- then y-axis angles."""
+    """Rotate a point around the configured x- then y-axis angles.
+
+    Gmsh exports the fjord in its native projection.  Downstream solvers expect
+    the domain to be aligned with the standard Cartesian axes.  We therefore
+    pre-compute the sine/cosine values above and apply a two-step rotation
+    (first about X, then Y) to every node before writing the final mesh.
+    """
     x_after_x = x
     y_after_x = y * ROTATE_X_COS - z * ROTATE_X_SIN
     z_after_x = y * ROTATE_X_SIN + z * ROTATE_X_COS
@@ -84,6 +110,7 @@ def rotate_coordinates(x, y, z):
     return x_after_y, y_after_y, z_after_y
 
 def get_grounding_line(seaice, landice):
+    """Return the shared points between the sea-ice and land-ice polylines."""
     grounding_line = []
     
     for coord in seaice:
@@ -93,6 +120,13 @@ def get_grounding_line(seaice, landice):
     return grounding_line
 
 def add_grounding_line(shoreline, grounding_line):
+    """Splice the grounding line polyline into the shoreline outline.
+
+    We want the final 2D mesh to contain a sharp feature where the ice sheet
+    detaches from the bed.  Gmsh can only preserve that feature if it is part
+    of the top-level boundary, so we rebuild the shoreline list to explicitly
+    insert the grounding-line points between the two matching shoreline points.
+    """
     
     p1 = grounding_line[0]
     p2 = grounding_line[-1]
@@ -110,6 +144,8 @@ def add_grounding_line(shoreline, grounding_line):
     if p2[0] == p4[0] and p2[1] == p4[1]:
         grounding_line = grounding_line[:-1]
     
+    # Remove shoreline points that sit “below” the grounding line so the
+    # stitched boundary stays monotonic along the fjord wall.
     while p3[1] < p1[1] and p4[1] < p2[1]:
         shoreline = shoreline[:tag1] + shoreline[tag1+1:]
         shoreline = shoreline[:tag2-1] + shoreline[tag2:]
@@ -133,6 +169,7 @@ def add_grounding_line(shoreline, grounding_line):
     return new_shoreline
 
 def find_closest_point(x, y, points):
+    """Return the index of the entry in `points` closest to `(x, y)`."""
     
     distances = {}
     
@@ -148,6 +185,7 @@ def find_closest_point(x, y, points):
     return closest_point_tag
 
 def get_water_ice_intersect(seaice, water):
+    """Return the shared polyline between the water and sea-ice outlines."""
     grounding_line = []
     
     for coord in seaice:
@@ -157,6 +195,7 @@ def get_water_ice_intersect(seaice, water):
     return grounding_line[:-1]
 
 def plot_main_geoline(shoreline):
+    """Quick matplotlib diagnostic for one polyline (left commented out)."""
     
     X = []
     Y = []
@@ -173,6 +212,7 @@ def plot_main_geoline(shoreline):
     # plt.draw()
     
 def plot_full_outline(lines):
+    """Debug helper to visualise multiple boundary polylines."""
     
     # plt.figure(figsize=(6,8))
     
@@ -196,6 +236,7 @@ def plot_full_outline(lines):
         
 
 def check_if_inflow(point, category_array, category_trans):
+    """Return True when the GIS raster marks this shoreline point as inflow."""
     
     x = point[0]
     y = point[1]
@@ -213,6 +254,8 @@ def check_if_inflow(point, category_array, category_trans):
     if cat == 6:
         return True
     elif cat != 3:
+        # Look in an 8-neighbour stencil so thin inflow channels do not get
+        # missed because a single shoreline vertex landed just outside them.
         if category_array[y_index - 1][x_index] == 6:
             return True
         elif category_array[y_index - 1][x_index - 1] == 6:
@@ -235,6 +278,7 @@ def check_if_inflow(point, category_array, category_trans):
         return False
 
 def get_shorelines(line_tags, intersect_tags, inflow_lines, grounding_lines):
+    """Return the line entities that form the exterior shoreline only."""
     
     shorelines = []
     inflow_line_tags = [tag for (dim, tag) in inflow_lines]
@@ -247,6 +291,7 @@ def get_shorelines(line_tags, intersect_tags, inflow_lines, grounding_lines):
     return shorelines
 
 def sanitize(val, eps):
+    """Clamp bathymetry samples that are positive or marked as nodata."""
     if val == -9999 or val > 0:
         return 0
     else:
@@ -254,12 +299,14 @@ def sanitize(val, eps):
 
 def bilinear_interpolate(data_array, i, j, dx, dy, eps, 
                          missing_value=-9999, sanitize=False):
+    """Evaluate a raster at fractional indices using bilinear interpolation."""
     v00 = data_array[j    , i    ]
     v10 = data_array[j    , i + 1]
     v01 = data_array[j + 1, i    ]
     v11 = data_array[j + 1, i + 1]
     
     if sanitize:
+        # For bathymetry we do not allow positive depths; clamp above sea level.
         v00 = min(v00, 0)
         v10 = min(v10, 0)
         v01 = min(v01, 0)
@@ -277,9 +324,12 @@ def bilinear_interpolate(data_array, i, j, dx, dy, eps,
 
 def get_bathymetric_depth(x, y, data_trans, data_array, highres_trans, 
                           highres_array, eps, highres = True, interpolate = True):
+    """Sample the fjord bathymetry, favouring the high-resolution raster."""
     
     if highres:
         try:
+            # Try the Sherard-Osborn 15 m product first – when available we get
+            # a much sharper representation of channels and ridges.
             top_left_x = highres_trans[0]
             x_res = highres_trans[1]
             top_left_y  = highres_trans[3]
@@ -291,6 +341,8 @@ def get_bathymetric_depth(x, y, data_trans, data_array, highres_trans,
             z = highres_array[y_index, x_index]
             
             if z > eps:
+                # Above sea level values happen near the coast.  Clamp to the
+                # ice draft instead so the mesh remains watertight.
                 return eps
             if z != -9999:
                 return z
@@ -328,6 +380,12 @@ def get_bathymetric_depth(x, y, data_trans, data_array, highres_trans,
     
 def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps, 
                   interpolate = True):
+    """Compute the draft of the floating ice tongue at (x, y).
+
+    The freeboard (surface minus thickness) can occasionally sit above the
+    seabed bathymetry.  We guard against that configuration by blending towards
+    the bathymetry value using the small `eps` offset.
+    """
     
     top_left_x = thic_trans[0]
     x_res = thic_trans[1]
@@ -339,6 +397,8 @@ def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps,
     py = (y - top_left_y) / y_res
     
     if interpolate:
+        # Evaluate thickness/surface rasters in the same bilinear fashion as
+        # the bathymetry to avoid discontinuities across pixel boundaries.
         i = int(np.floor(px))
         j = int(np.floor(py))
 
@@ -371,19 +431,32 @@ def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps,
 
 def generate_2D_mesh(outline, intersect, grounding_line, category_data, 
                      m, eps, num_of_layers, adapt, adaptive_scales = (1/4, 2)):
+    """Create the surface mesh that will later be extruded to 3D.
+
+    The 2D stage wires up every shoreline, grounding line, and inflow segment
+    as explicit curves.  That makes it much easier to preserve important
+    physical boundaries once we start extruding with Gmsh.
+    """
     
     gmsh.initialize()
     
     model = gmsh.model
     model.add("2D")
+    # All geometry entities created below live in this temporary 2D model; we
+    # return only the mesh and a few helper lists for the 3D stage.
     
     if adapt:
+        # Use three characteristic lengths: fine on the grounding line, medium
+        # along the inflow, and coarser away from the ice where gradients are
+        # smaller.
         sizes = (adaptive_scales[0]*m, m, adaptive_scales[1]*m)
     else:
         sizes = (m,m,m)
     
     category_array = category_data.ReadAsArray()
     category_trans = category_data.GetGeoTransform()
+    # GIS categories mark inflow vs. ice vs. open water; they drive both
+    # sizing choices and physical-group labelling below.
     
     coords = outline
     intersect_points = intersect
@@ -392,6 +465,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     outline_len = len(coords)
     p1 = intersect_points[0]
     p2 = intersect_points[-1]
+    # These indices help us splice the water/ice intersection onto the outer
+    # boundary loop in a consistent orientation.
     
     tag1 = find_closest_point(p1[0], p1[1], coords) + 1
     tag2 = find_closest_point(p2[0], p2[1], coords) + 1
@@ -401,20 +476,30 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     lines = []
     inflow_lines = []
     grounding_lines = []
+    # We accumulate every curve entity to assemble plane surfaces and later
+    # tag physical groups.
     
+    # Lay down the boundary polyline one vertex at a time, switching the target
+    # element size depending on whether we are close to the grounding line or
+    # an inflow channel.
     point = model.geo.addPoint(first_point[0], first_point[1], 0, sizes[1])
     i = 1
+    # Trace the shoreline polyline, attaching a new point+edge per vertex.
     for coord in coords[1:]:
         if point_in_set(coord, grounding_points):
+            # Grounding-line vertices need the smallest h so later extrusions
+            # capture the contact curve sharply.
             point = model.geo.addPoint(coord[0], coord[1], 0, sizes[0])
         elif point+1 > tag1-1 and point < tag2:
             point = model.geo.addPoint(coord[0], coord[1], 0, sizes[1])
         else:
+            # Everything else is further away from strong gradients.
             point = model.geo.addPoint(coord[0], coord[1], 0, sizes[2])
         
         line = model.geo.addLine(point - 1, point)
         lines.append(line)
         
+        # Store curve tags for later physical-group assignment.
         if (check_if_inflow(coords[i-1], category_array, category_trans)
             and check_if_inflow(coords[i], category_array, category_trans)):
             inflow_lines.append((1, line))
@@ -427,13 +512,16 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             grounding_lines.append((1, line))
         i += 1
         
+    # Close the outer loop by linking the last shoreline vertex to the first.
     line = model.geo.addLine(point, 1)
     lines.append(line)
-    
+
     if (check_if_inflow(first_point, category_array, category_trans)
         and check_if_inflow(coords[-1], category_array, category_trans)):
         inflow_lines.append((1, line))
     first_intersect_point = intersect_points[0]
+    # Stitch the water/ice intersection onto the boundary loop so Gmsh can
+    # extrude distinct inflow surfaces later.
     point = model.geo.addPoint(first_intersect_point[0], 
                                first_intersect_point[1], 0, sizes[1])
     line = model.geo.addLine(tag1, point)
@@ -445,6 +533,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     line = model.geo.addLine(point, tag2)
     lines.append(line)
     
+    # Build two curve loops: one for the full shoreline, one for the inlet
+    # patch carved out by the water/ice intersection.
     first_part = lines[:tag1-1]
     intersection = lines[outline_len:]
     second_part = lines[tag2-1:outline_len]
@@ -462,14 +552,37 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     
     shorelines = get_shorelines(lines, intersection, inflow_lines, grounding_lines)
     intersect_lines = [(1, line) for line in intersection]
-    
+
+    boundary_curve_tags = set(lines)
+    boundary_curve_tags.update(tag for (_, tag) in shorelines)
+    boundary_curve_tags.update(tag for (_, tag) in inflow_lines)
+    boundary_curve_tags.update(tag for (_, tag) in grounding_lines)
+    boundary_curve_tags.update(intersection)
+
     model.geo.synchronize()
+
+    if boundary_curve_tags:
+        field_api = gmsh.model.mesh.field
+        distance_field = field_api.add("Distance")
+        field_api.setNumbers(distance_field, "CurvesList", sorted(boundary_curve_tags))
+        field_api.setNumber(distance_field, "Sampling", 50)
+
+        boundary_field = field_api.add("Threshold")
+        field_api.setNumber(boundary_field, "IField", distance_field)
+        field_api.setNumber(boundary_field, "LcMin", sizes[0])
+        field_api.setNumber(boundary_field, "LcMax", sizes[2])
+        field_api.setNumber(boundary_field, "DistMin", float(0.01))
+        field_api.setNumber(boundary_field, "DistMax", float(10.0))
+        field_api.setAsBackgroundMesh(boundary_field)
+
     model.mesh.generate(2)
         
     ice = [surface2]
     inflow = []
     bath = []
     mid_layers = []
+    # As we extrude layer by layer we keep track of which newly created
+    # surfaces belong to the ice shelf, bathymetry, inflow, or interior slabs.
         
     ice_line_ents = set(grounding_lines)
     bath_line_ents = set(shorelines)
@@ -483,7 +596,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     
     all_inflow_lines = inflow_line_ents
     for layer in range(2, num_of_layers+1):
-        
+        # Step the 2D surface downward by `eps/(layers-1)` so each layer ends up
+        # with an identical thickness when we later sculpt the bathymetry.
         extrustion = model.geo.extrude(extrude_from, 0, 0, 
                                        round(eps*(1/(num_of_layers-1))), #avoid float rounding error
                                        numElements=[1])
@@ -496,31 +610,42 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         next_intersect = []
         
         for entity in extrustion:
+            # Gmsh returns both volume (dim=3) and surface (dim=2) entities; we
+            # only keep the surfaces and classify them by adjacency.
             if entity[0] == 3:
                 model.geo.remove([entity], recursive=False)
             else:
                 bound = model.getBoundary([entity], oriented=False)
                 bound_set = set(bound)
-                
+
                 if len(bound_set.intersection(ice_line_ents)) > 0:
+                    # Faces touching the grounding line belong to the ice shelf.
                     ice.append(entity[1])
                     next_ice = next_ice + bound
                 elif len(bound_set.intersection(bath_line_ents)) > 0:
+                    # Faces attached to the outer shoreline become bathymetry walls.
                     bath.append(entity[1])
                     next_bath = next_bath + bound
                 elif len(bound_set.intersection(inflow_line_ents)) > 0:
+                    # Inflow surfaces are tracked separately for boundary conditions.
                     inflow.append(entity[1])
                     next_inflow = next_inflow + bound
                 elif len(bound_set.intersection(intersect_line_ents)) > 0:
+                    # The inlet cut-out is discarded after the first extrude pass.
                     model.geo.remove([entity], recursive=True)
                     next_intersect = next_intersect + bound
                 else:
                     if layer == num_of_layers:
+                        # The bottom-most cap defaults to bathymetry.
                         bath.append(entity[1])
                     else:
+                        # Everything in between becomes an internal slab so we
+                        # can reposition it during the 3D morphing stage.
                         mid_layers.append(entity[1])
                     next_extrusion.append(entity)
         if layer != num_of_layers:
+            # Record surface IDs for the next pair of internal layers; the 3D
+            # stage uses these markers when redistributing vertical nodes.
             mid_group_1.append(min([tag for (dim, tag) in next_extrusion])) 
             mid_group_2.append(max([tag for (dim, tag) in next_extrusion]))            
         extrude_from = next_extrusion
@@ -534,7 +659,12 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     model.geo.synchronize()
     
     all_inflow_lines = [tag for dim, tag in all_inflow_lines]
+    # Drop dimension indices so we can register the curves directly as a
+    # physical line group.
     
+    # Physical groups map mesh regions to boundary conditions in downstream
+    # solvers (FEniCS, etc.).  Keep them descriptive so post-processing stays
+    # readable.
     model.geo.addPhysicalGroup(2, [surface1], tag=WATER_SURFACE_TAG, name="Water Surface")
     model.geo.addPhysicalGroup(2, ice, tag=ICE_TAG, name="Ice")
     model.geo.addPhysicalGroup(2, bath, tag=BATHYMETRY_TAG, name="Bathymetry")
@@ -547,6 +677,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     model.geo.synchronize()
     model.mesh.generate(2)
     
+    # Store the XY footprint of important curves so the 3D stage can spot when
+    # it is adjusting nodes that lie on the shoreline or grounding line.
     xy_shoreline = []
     shore_tags = [tag for (dim, tag) in shorelines]
     for line in shore_tags:
@@ -585,10 +717,11 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                        bathymetry_data, highres_data, thickness_data, surface_pos_data, 
                        scale = 1, num_of_layers = 2, adapt = False, adaptive_scales = (1/4, 2),
                        optimize = False, stack = 25, interpolate = True):
+    """Extrude the 2D surface mesh into 3D and sculpt it with raster data."""
     
     if num_of_layers > 2:
         eps = eps*(num_of_layers - 1)
-    
+
     mesh2D = generate_2D_mesh(outline, intersect, grounding_line, 
                               category_data, m, eps, num_of_layers, adapt)
 
@@ -621,6 +754,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     model = gmsh.model
     model.add("3D")
     
+    # Re-open the 2D mesh we just wrote so we can extrude it inside the fresh
+    # 3D model.  `merge` imports both geometry and mesh entities.
     gmsh.merge(filename)
 
     model.geo.synchronize()
@@ -643,6 +778,9 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     ice_node_coords = ice_node_coords.reshape((ice_node_tags.size, 3))
     
     if stack > 0:
+        # Stacked meshes include additional horizontal slices (synthetic layers
+        # every `stack` metres).  These extra points become seeds for the later
+        # Cartesian layers we embed in the final tetrahedral mesh.
         scale = 1
         xy_ice = [(i[0], i[1]) for i in ice_node_coords]
         xy_surface = [(i[0], i[1]) for i in surface_node_coords]
@@ -672,6 +810,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             y = bathymetry_node_coords[i][1]
                
             if not point_in_set((x,y), xy_shoreline):#(x, y) not in xy_shoreline:
+                # Drive each bathymetry vertex to the raster-derived depth and
+                # optionally create extra points for stacked layers.
                 z = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
                                               highres_trans, highres_array, eps, 
                                               highres = True, interpolate = interpolate)
@@ -695,12 +835,16 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             y = ice_node_coords[i][1]
             
             if (point_in_set((x,y), xy_grounding)) and (tag not in bathymetry_node_tags):
+                # Grounded ice merges smoothly into the bedrock; keep it just
+                # above the seabed using the small epsilon offset.
                 depth = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
                                               highres_trans, highres_array, eps, 
                                               highres = True, interpolate = interpolate)
                 z = depth - eps
                 gmsh.model.mesh.setNode(tag, [x, y, scale*z], [])
             elif tag not in bathymetry_node_tags:
+                # Floating ice uses the thickness and surface elevation rasters
+                # to determine its draft before we rescale vertically.
                 z = get_ice_depth(x, y, thickness_trans, thickness_array, 
                                       surface_pos_array, bathymetry_array, 
                                       eps, interpolate = interpolate)
@@ -718,9 +862,16 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         i += 1
     
     if num_of_layers == 2:
+        # The 2-layer meshes dedicate one surface to bathymetry and one to the
+        # water/ice interface.  In that case we rebuild inflow patches manually
+        # so stacked points can tie into them cleanly.
         
         inflow_ents = gmsh.model.getEntitiesForPhysicalGroup(2, INFLOW_TAG)
+        # Physical groups from the 2D mesh do not survive the manual stacking
+        # tweaks.  Remove and recreate them once we have injected extra points.
         model.geo.removePhysicalGroups([(2, INFLOW_TAG)])
+        # Layered meshes do not need the 1D inflow tags; clear them so we can
+        # rebuild higher dimensional embeddings below.
         model.geo.removePhysicalGroups([(1, INFLOW_LINE_TAG)])
         new_inflow = []
         
@@ -740,14 +891,16 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         new_lines = []
         skip = []
         for new_bound, inflow_coord_set in inflow_data:
-                
+            # Gmsh returns the boundary of each inflow surface as a list of
+            # curve IDs.  We rebuild the loop to insert extra stacked points,
+            # ensuring vertical prisms line up with inflow faces.
             new_bound = [new_bound[0], new_bound[-1], new_bound[1], new_bound[2]]
-            
+
             if stack > 0:
 
                 surface_stack_points = []
                 for x, y in inflow_coord_set:
-                    
+
                     if point_in_set((x,y), skip):
                         new_bound = [new_bound[0], new_bound[1], new_bound[2], [-i for i in new_lines[::-1]]]
                     elif (not point_in_set((x,y), xy_shoreline)) and (not point_in_set((x,y), point_xy)):
@@ -801,6 +954,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         gmsh.model.geo.synchronize()
         
         if stack > 0:
+            # Anchor the newly created vertical stack points into the inflow
+            # surface so later tetrahedra follow those columns.
             for surface in inflow_stack_points.keys():
                 model.mesh.embed(0, inflow_stack_points[surface], 2, surface)
 
@@ -816,7 +971,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
 
         surf_loop = gmsh.model.geo.addSurfaceLoop(surf_tags)
         vol = gmsh.model.geo.addVolume([surf_loop])
-        
+
         if stack > 0:
             gmsh.model.geo.synchronize()
             model.mesh.embed(0, stacked_points, 3, vol)
@@ -933,6 +1088,10 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         if scale > 1:
             gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", 1e-13)
 
+    if optimize:
+        # Light Laplacian smoothing when quality tuning is requested.
+        gmsh.option.setNumber("Mesh.Smoothing", 5)
+
     model.mesh.generate(3)
         
     model.mesh.reclassifyNodes()
@@ -951,6 +1110,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     print(meshname)
 
+    # Rotate and shift the mesh so that the inlet aligns with the solver axes
+    # and the minimum corner starts at (0, 0, 0).
     rotated_nodes = []
     min_rot_x = float("inf")
     min_rot_y = float("inf")
@@ -980,7 +1141,10 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     model.geo.synchronize()
     
     if optimize:
+        # Optional smoothing passes (first default, then Netgen) to improve
+        # element quality when requested.
         gmsh.model.mesh.optimize(method="")
+        # gmsh.model.mesh.optimize(method="Lloyd") # Lukas: gave error for me 
         gmsh.model.mesh.optimize(method="Netgen")
         model.geo.synchronize()
         water_node_tags, water_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(3, 5)
@@ -992,6 +1156,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     return dof, meshname
 
 def main():
+    """Batch-generate meshes for a selection of resolutions/settings."""
     elevation = readraster('../data/gis_data/bathymetry.tif')
     elevation_band = elevation.GetRasterBand(1)
 
@@ -1167,7 +1332,7 @@ def main():
         Scenario(410, 39, 13, False, False, 0),
     ]
     
-    params = stacked#combo_test
+    params = adaptive#stacked#combo_test
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
