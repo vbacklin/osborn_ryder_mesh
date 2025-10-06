@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 def convert_msh_to_xdmf(filename):
+    """Split a Gmsh `.msh` file into volume and surface XDMF datasets."""
     
     msh = meshio.read(filename)
     
@@ -37,6 +38,7 @@ def convert_msh_to_xdmf(filename):
     return vmesh_name, smesh_name
 
 def loadmesh(filename):
+    """Read an XDMF mesh into a FEniCS `Mesh` object."""
 
     xdmf_mesh = filename
     with df.XDMFFile(xdmf_mesh) as xdmf_infile:
@@ -46,6 +48,7 @@ def loadmesh(filename):
     return mesh
 
 def get_boundary_nodes(V):
+    """Collect all dofs that lie on the exterior boundary of the mesh."""
     dofmap = V.dofmap()
     mesh = V.mesh()
     
@@ -61,6 +64,7 @@ def get_boundary_nodes(V):
     
 def create_reference_solution(k = 1, space = 1, m=220, scale=6, num_of_layers = 2, 
                               adapt = False, opt = False, stack = 0, cube=False):
+    """Export the analytical solution on a reference mesh for visual checks."""
     
     if cube:
         filename = "../gmsh example/ref_cube_m001.msh"
@@ -114,6 +118,7 @@ def create_reference_solution(k = 1, space = 1, m=220, scale=6, num_of_layers = 
 
 def ryder_poisson(k = 1, space = 1, m=400, scale=1, num_of_layers = 2, 
                   adapt = False, opt = False, stack = 0):
+    """Solve the manufactured Poisson problem on one of the generated meshes."""
     
     prefix = '../mesh/'
     if scale > 1:
@@ -246,11 +251,13 @@ def ryder_poisson(k = 1, space = 1, m=400, scale=1, num_of_layers = 2,
             format_float(median_error), min_max_radius_ratio], csv_path
 
 def format_float(x):
+    """Helper to format floats consistently when writing CSV summaries."""
     if isinstance(x, float):
         return f"{x:.3g}"
     return x
 
 def main():
+    """Run a battery of Poisson solves and store their error statistics."""
         
     csv_path = "results/analytical/all.csv"
     

@@ -12,6 +12,7 @@ import re
 plt.style.use('seaborn-v0_8')
 
 def get_outline(filename):
+    """Read the shoreline outline file saved by the mesher and normalise it."""
     outline_x = []
     outline_y = []
     with open(filename, 'r') as f:
@@ -38,6 +39,7 @@ def get_outline(filename):
     return outline_x, outline_y
 
 def extract_surface_geometry_points(filename, target_marker=None):
+    """Return unique surface vertices filtered by their Gmsh physical marker."""
     msh = meshio.read(filename)
     
     all_points = msh.points 
@@ -63,6 +65,7 @@ def extract_surface_geometry_points(filename, target_marker=None):
     return surface_points 
 
 def format_latex_name(mesh_name):
+    """Pretty-print mesh identifiers using LaTeX-friendly notation."""
     # Adaptive stacked mesh: A_P_10_600 → P_{10/(150,600,1200)}
     match = re.match(r"A_([A-Z]+)_(\d+)_(\d+)", mesh_name)
     if match:
@@ -98,6 +101,7 @@ def format_latex_name(mesh_name):
     return mesh_name
 
 def plot_relative_error(csv_path, mesh_type, limit_y_scale = None, figsize=(10, 6)):
+    """Plot the Poisson relative error curves for the selected mesh family."""
     # Load the data
     df = pd.read_csv(csv_path)
 
@@ -142,6 +146,7 @@ def plot_relative_error(csv_path, mesh_type, limit_y_scale = None, figsize=(10, 
     plt.show()
 
 def plot_node_count(txt_files, Title = None, figsize=(10,6)):
+    """Visualise how the total degrees of freedom grow with vertical scaling."""
     
     plt.figure()
     
@@ -222,6 +227,7 @@ def parse_gmsh_quality(filename):
     return qualities, counts
 
 def plot_mesh_qualities(filenames, mesh_type, figsize=(10,6)):
+    """Plot the element quality histogram exported by Gmsh for each mesh."""
     
     all_qualities = []
     all_counts = []
@@ -258,6 +264,7 @@ def plot_mesh_qualities(filenames, mesh_type, figsize=(10,6)):
                title="Mesh", fontsize=9)
 
 def tick_format(x,y):
+    """Formatter used to keep colour bar tick labels readable."""
     if x == 0:
         return 0
     elif x < 0.01:
@@ -270,6 +277,7 @@ def tick_format(x,y):
         return f"{round(x)}"
 
 def interpolate_averaged_pointwise_error(filename, resolution=500, csv_path = None, limit=None):
+    """Map the vertically averaged pointwise error back onto the fjord outline."""
     
     file_list = filename.split('/')
     error_file = file_list[-1].split('_error_')
@@ -361,6 +369,7 @@ def interpolate_averaged_pointwise_error(filename, resolution=500, csv_path = No
     print(np.nanmax(grid_z))
     
 def plot_gradient(filename, target_marker=None, resolution=2000, limit = None):
+    """Visualise surface slope magnitude using interpolated surface meshes."""
     
     file_list = filename.split('/')
     mesh_file = file_list[-1].split('.')
@@ -412,6 +421,7 @@ def plot_gradient(filename, target_marker=None, resolution=2000, limit = None):
     return np.nanmax(masked_grad)
 
 def plot_vertical_extent(filename, resolution=2000):
+    """Plot the vertical distance between bathymetry and surface meshes."""
     
     file_list = filename.split('/')
     mesh_file = file_list[-1].split('.')
@@ -458,6 +468,7 @@ def plot_vertical_extent(filename, resolution=2000):
     print(np.nanmax(grid_z))
     
 def final_format_table(infile_name):
+    """Reformat a CSV file so it can be pasted straight into a LaTeX table."""
     outfile_name = infile_name[:-4] + '.txt'
     with open(infile_name, "r") as in_file:
         with open(outfile_name, "w") as out_file:
