@@ -1,7 +1,8 @@
 # import matplotlib.pyplot as plt
 import math
+from collections import defaultdict
 from pathlib import Path
-from typing import NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 import gmsh
 from osgeo import gdal
@@ -15,8 +16,7 @@ gdal.UseExceptions()
 BATHYMETRY_TAG = 2
 INFLOW_LINE_TAG = 3
 GROUNDING_LINE_TAG = 6
-BOUNDARY_BAND_TAG = 7
-INTERIOR_SURFACE_TAG = 8
+DEFAULT_SURFACE_TAG = 999
 
 def readraster(filename):
     """Load a raster with GDAL and write a working copy next to our scripts.
@@ -253,10 +253,10 @@ def _distance_to_outline(px: float, py: float, outline: Tuple[Tuple[float, float
 
 
 def tag_boundary_band_elements(outline: Tuple[Tuple[float, float], ...],
-                               band_width: float) -> None:
-    """Create two discrete surfaces based on distance from shoreline."""
+                               band_width: float) -> Dict[int, Set[int]]:
+    """Return surface triangles whose centroids lie within ``band_width``."""
     if not band_width or band_width <= 0:
-        return
+        return {}
 
     node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
     coord_lookup = {}
@@ -266,9 +266,7 @@ def tag_boundary_band_elements(outline: Tuple[Tuple[float, float], ...],
             float(node_coords[3 * idx + 1])
         )
 
-    boundary_elements = {}
-    interior_elements = {}
-    removal_map = {}
+    boundary_triangles: Dict[int, Set[int]] = defaultdict(set)
 
     for _, surface_tag in gmsh.model.getEntities(2):
         elem_types, elem_tags_list, elem_node_tags_list = gmsh.model.mesh.getElements(2, surface_tag)
@@ -278,6 +276,9 @@ def tag_boundary_band_elements(outline: Tuple[Tuple[float, float], ...],
             if elem_tags.size == 0:
                 continue
             _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+            if num_nodes != 3:
+                # Only refine first-order triangles; skip other element types.
+                continue
             tags = elem_tags.tolist()
             nodes = elem_node_tags.tolist()
             for idx, elem_tag in enumerate(tags):
@@ -285,38 +286,10 @@ def tag_boundary_band_elements(outline: Tuple[Tuple[float, float], ...],
                 cx = sum(coord_lookup[int(n)][0] for n in node_ids) / num_nodes
                 cy = sum(coord_lookup[int(n)][1] for n in node_ids) / num_nodes
                 distance = _distance_to_outline(cx, cy, outline)
-                target = boundary_elements if distance <= band_width else interior_elements
-                if elem_type not in target:
-                    target[elem_type] = {"tags": [], "nodes": []}
-                target[elem_type]["tags"].append(int(elem_tag))
-                target[elem_type]["nodes"].append([int(n) for n in node_ids])
+                if distance <= band_width:
+                    boundary_triangles[int(surface_tag)].add(int(elem_tag))
 
-                removal_map.setdefault(surface_tag, []).append(int(elem_tag))
-
-    if not boundary_elements and not interior_elements:
-        return
-
-    for surface_tag, elem_tags in removal_map.items():
-        if elem_tags:
-            gmsh.model.mesh.removeElements(2, surface_tag, elem_tags)
-
-    def _create_surface(data_map, phys_tag, name):
-        if not data_map:
-            return None
-        entity = gmsh.model.addDiscreteEntity(2)
-        elem_types = sorted(data_map.keys())
-        elem_tags = [data_map[et]["tags"] for et in elem_types]
-        elem_nodes = [
-            [node for nodes in data_map[et]["nodes"] for node in nodes]
-            for et in elem_types
-        ]
-        gmsh.model.mesh.addElements(2, entity, elem_types, elem_tags, elem_nodes)
-        gmsh.model.addPhysicalGroup(2, [entity], tag=phys_tag)
-        gmsh.model.setPhysicalName(2, phys_tag, name)
-        return entity
-
-    _create_surface(boundary_elements, BOUNDARY_BAND_TAG, "BoundaryBand")
-    _create_surface(interior_elements, INTERIOR_SURFACE_TAG, "InteriorSurface")
+    return {surf: triangles for surf, triangles in boundary_triangles.items() if triangles}
 
 def generate_2D_mesh(
     outline,
@@ -331,10 +304,9 @@ def generate_2D_mesh(
 ):
     """Build a 2D mesh with shoreline, inflow, and grounding-line markers.
 
-    When ``boundary_band_width`` is set, the generated Gmsh file is rewritten so
-    that triangles within that distance from the shoreline are tagged with a
-    dedicated "BoundaryBand" physical surface, while the remaining triangles
-    are collected in "InteriorSurface".
+    When ``boundary_band_width`` is set, triangles whose centroids lie within
+    that distance from the shoreline are locally refined after the initial
+    meshing step.  Existing physical groups remain untouched.
     """
 
     gmsh.initialize()
@@ -470,10 +442,241 @@ def generate_2D_mesh(
     model.geo.synchronize()
     model.mesh.generate(2)
 
+    band_triangles: Dict[int, Set[int]] = {}
     if boundary_band_width and boundary_band_width > 0:
         outline_tuple = tuple((float(x), float(y)) for (x, y) in coords)
-        tag_boundary_band_elements(outline_tuple, boundary_band_width)
+        band_triangles = tag_boundary_band_elements(outline_tuple, boundary_band_width)
 
+    if band_triangles:
+        all_node_tags, all_node_coords, _ = gmsh.model.mesh.getNodes()
+        tag_list = all_node_tags.tolist() if hasattr(all_node_tags, "tolist") else list(all_node_tags)
+        coord_list = all_node_coords.tolist() if hasattr(all_node_coords, "tolist") else list(all_node_coords)
+        coord_lookup = {}
+        for idx, tag in enumerate(tag_list):
+            coord_lookup[int(tag)] = (
+                float(coord_list[3 * idx]),
+                float(coord_list[3 * idx + 1]),
+                float(coord_list[3 * idx + 2]),
+            )
+
+        triangle_type = gmsh.model.mesh.getElementType("Triangle", 1)
+        line_type = gmsh.model.mesh.getElementType("Line", 1)
+        next_node_tag = gmsh.model.mesh.getMaxNodeTag() + 1
+        next_element_tag = gmsh.model.mesh.getMaxElementTag() + 1
+
+        surface_triangles = defaultdict(list)
+        edge_to_surfaces = defaultdict(list)
+
+        for _, surface_tag in gmsh.model.getEntities(2):
+            elem_types, elem_tags_list, elem_node_tags_list = gmsh.model.mesh.getElements(2, surface_tag)
+            for elem_type, elem_tags, elem_nodes in zip(elem_types, elem_tags_list, elem_node_tags_list):
+                tags = elem_tags.tolist() if hasattr(elem_tags, "tolist") else list(elem_tags)
+                nodes = elem_nodes.tolist() if hasattr(elem_nodes, "tolist") else list(elem_nodes)
+                if not tags:
+                    continue
+                _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+                if num_nodes != 3:
+                    continue
+                for idx, elem_tag in enumerate(tags):
+                    start = idx * num_nodes
+                    node_ids = [int(n) for n in nodes[start:start + num_nodes]]
+                    surface_triangles[surface_tag].append({
+                        "tag": int(elem_tag),
+                        "nodes": node_ids,
+                    })
+                    edges = (
+                        (node_ids[0], node_ids[1]),
+                        (node_ids[1], node_ids[2]),
+                        (node_ids[2], node_ids[0]),
+                    )
+                    for edge in edges:
+                        edge_key = tuple(sorted(edge))
+                        edge_to_surfaces[edge_key].append((surface_tag, int(elem_tag)))
+
+        edge_to_curves = defaultdict(list)
+        for _, curve_tag in gmsh.model.getEntities(1):
+            elem_types, elem_tags_list, elem_node_tags_list = gmsh.model.mesh.getElements(1, curve_tag)
+            for elem_type, elem_tags, elem_nodes in zip(elem_types, elem_tags_list, elem_node_tags_list):
+                tags = elem_tags.tolist() if hasattr(elem_tags, "tolist") else list(elem_tags)
+                nodes = elem_nodes.tolist() if hasattr(elem_nodes, "tolist") else list(elem_nodes)
+                if not tags:
+                    continue
+                _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+                if num_nodes != 2:
+                    continue
+                for idx, elem_tag in enumerate(tags):
+                    start = idx * num_nodes
+                    n1, n2 = [int(n) for n in nodes[start:start + num_nodes]]
+                    edge_key = tuple(sorted((n1, n2)))
+                    edge_to_curves[edge_key].append((curve_tag, int(elem_tag), [n1, n2]))
+
+        edges_to_split = {}
+        for surface_tag, triangle_set in band_triangles.items():
+            for tri in surface_triangles.get(surface_tag, []):
+                if tri["tag"] not in triangle_set:
+                    continue
+                nodes = tri["nodes"]
+                for edge in (
+                    (nodes[0], nodes[1]),
+                    (nodes[1], nodes[2]),
+                    (nodes[2], nodes[0]),
+                ):
+                    edge_key = tuple(sorted(edge))
+                    adjacency = edge_to_surfaces.get(edge_key, [])
+                    if not adjacency:
+                        continue
+                    targeted_adjacency = [
+                        (surf, elem_tag)
+                        for (surf, elem_tag) in adjacency
+                        if elem_tag in band_triangles.get(surf, set())
+                    ]
+                    if len(adjacency) == 1:
+                        if targeted_adjacency:
+                            edges_to_split[edge_key] = targeted_adjacency
+                    elif len(adjacency) == len(targeted_adjacency) and targeted_adjacency:
+                        edges_to_split[edge_key] = targeted_adjacency
+
+        entity_nodes_to_add: Dict[Tuple[int, int], Dict[str, List[float]]] = {}
+        entity_node_sets: Dict[Tuple[int, int], Set[int]] = {}
+
+        def schedule_node(dim: int, entity_tag: int, node_tag: int, coords: Tuple[float, float, float]) -> None:
+            key = (dim, entity_tag)
+            if key not in entity_nodes_to_add:
+                entity_nodes_to_add[key] = {"tags": [], "coords": []}
+                entity_node_sets[key] = set()
+            if node_tag not in entity_node_sets[key]:
+                entity_node_sets[key].add(node_tag)
+                entity_nodes_to_add[key]["tags"].append(int(node_tag))
+                entity_nodes_to_add[key]["coords"].extend(coords)
+
+        edge_midpoints: Dict[Tuple[int, int], int] = {}
+        curve_updates: Dict[int, List[Tuple[int, List[int], int]]] = defaultdict(list)
+
+        for edge_key, adjacency in edges_to_split.items():
+            n1, n2 = edge_key
+            p1 = coord_lookup[n1]
+            p2 = coord_lookup[n2]
+            midpoint = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0, (p1[2] + p2[2]) / 2.0)
+
+            midpoint_tag = next_node_tag
+            next_node_tag += 1
+            coord_lookup[midpoint_tag] = midpoint
+            edge_midpoints[edge_key] = midpoint_tag
+
+            surfaces = {surf for surf, _ in adjacency}
+            for surface_tag in surfaces:
+                schedule_node(2, surface_tag, midpoint_tag, midpoint)
+
+            if len(adjacency) == 1:
+                for curve_tag, elem_tag, node_seq in edge_to_curves.get(edge_key, []):
+                    schedule_node(1, curve_tag, midpoint_tag, midpoint)
+                    curve_updates[curve_tag].append((elem_tag, node_seq, midpoint_tag))
+
+        triangle_centroids: Dict[Tuple[int, int], int] = {}
+        for surface_tag, triangle_set in band_triangles.items():
+            for tri in surface_triangles.get(surface_tag, []):
+                if tri["tag"] not in triangle_set:
+                    continue
+                n1, n2, n3 = tri["nodes"]
+                p1 = coord_lookup[n1]
+                p2 = coord_lookup[n2]
+                p3 = coord_lookup[n3]
+                centroid = (
+                    (p1[0] + p2[0] + p3[0]) / 3.0,
+                    (p1[1] + p2[1] + p3[1]) / 3.0,
+                    (p1[2] + p2[2] + p3[2]) / 3.0,
+                )
+                centroid_tag = next_node_tag
+                next_node_tag += 1
+                coord_lookup[centroid_tag] = centroid
+                triangle_centroids[(surface_tag, tri["tag"])] = centroid_tag
+                schedule_node(2, surface_tag, centroid_tag, centroid)
+
+        for (dim, entity_tag), data in entity_nodes_to_add.items():
+            gmsh.model.mesh.addNodes(dim, entity_tag, data["tags"], data["coords"])
+
+        curve_removals: Dict[int, Set[int]] = defaultdict(set)
+        curve_new_segments: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for curve_tag, updates in curve_updates.items():
+            for elem_tag, node_seq, midpoint_tag in updates:
+                curve_removals[curve_tag].add(elem_tag)
+                start, end = node_seq
+                curve_new_segments[curve_tag].append((start, midpoint_tag))
+                curve_new_segments[curve_tag].append((midpoint_tag, end))
+
+        for curve_tag, removals in curve_removals.items():
+            if removals:
+                gmsh.model.mesh.removeElements(1, curve_tag, list(removals))
+            new_tags = []
+            new_nodes = []
+            for start, end in curve_new_segments[curve_tag]:
+                new_tags.append(next_element_tag)
+                next_element_tag += 1
+                new_nodes.extend([start, end])
+            if new_tags:
+                gmsh.model.mesh.addElements(1, curve_tag, [line_type], [new_tags], [new_nodes])
+
+        for surface_tag, triangle_set in band_triangles.items():
+            triangles = surface_triangles.get(surface_tag, [])
+            if not triangles:
+                continue
+
+            removal_tags = [tri["tag"] for tri in triangles if tri["tag"] in triangle_set]
+            if removal_tags:
+                gmsh.model.mesh.removeElements(2, surface_tag, removal_tags)
+
+            new_triangle_tags = []
+            new_triangle_nodes = []
+
+            for tri in triangles:
+                if tri["tag"] not in triangle_set:
+                    continue
+                nodes = tri["nodes"]
+                centroid_tag = triangle_centroids[(surface_tag, tri["tag"])]
+
+                boundary_nodes: List[int] = []
+                for idx in range(3):
+                    current = nodes[idx]
+                    if not boundary_nodes or boundary_nodes[-1] != current:
+                        boundary_nodes.append(current)
+                    next_idx = (idx + 1) % 3
+                    edge_key = tuple(sorted((nodes[idx], nodes[next_idx])))
+                    midpoint_tag = edge_midpoints.get(edge_key)
+                    if midpoint_tag is not None:
+                        boundary_nodes.append(midpoint_tag)
+
+                boundary_length = len(boundary_nodes)
+                for idx in range(boundary_length):
+                    n1 = boundary_nodes[idx]
+                    n2 = boundary_nodes[(idx + 1) % boundary_length]
+                    if n1 == n2:
+                        continue
+                    new_triangle_tags.append(next_element_tag)
+                    next_element_tag += 1
+                    new_triangle_nodes.extend([n1, n2, centroid_tag])
+
+            if new_triangle_tags:
+                gmsh.model.mesh.addElements(
+                    2,
+                    surface_tag,
+                    [triangle_type],
+                    [new_triangle_tags],
+                    [new_triangle_nodes],
+                )
+
+        gmsh.model.mesh.renumberNodes()
+        gmsh.model.mesh.renumberElements()
+
+    if not gmsh.model.getPhysicalGroups(2):
+        surface_entities = [tag for (_, tag) in gmsh.model.getEntities(2)]
+        if surface_entities:
+            try:
+                group_tag = gmsh.model.addPhysicalGroup(2, surface_entities, tag=DEFAULT_SURFACE_TAG)
+            except RuntimeError:
+                group_tag = gmsh.model.addPhysicalGroup(2, surface_entities)
+            gmsh.model.setPhysicalName(2, group_tag, "AllSurfaces")
+
+    gmsh.option.setNumber("Mesh.SaveAll", 1)
     mesh_filename = filename or f"2D_mesh_{int(element_size)}m.msh"
     gmsh.write(mesh_filename)
 
