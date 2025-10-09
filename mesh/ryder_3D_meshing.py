@@ -7,7 +7,7 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-from typing import NamedTuple
+from typing import NamedTuple, Sequence, List
 from pathlib import Path
 import subprocess, sys
 
@@ -29,6 +29,38 @@ ROTATE_X_COS = math.cos(ROTATE_X_RAD)
 ROTATE_X_SIN = math.sin(ROTATE_X_RAD)
 ROTATE_Y_COS = math.cos(ROTATE_Y_RAD)
 ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
+
+# Physical groups to target (optional).
+phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
+phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
+
+# Band + sizes (units match the mesh coordinates)
+band_width_min = 1000.0     # Distance at which lc_min applies
+band_width_max = 2000.0     # Distance where size fades back to lc_max
+lc_min = 200.0              # Fine size inside the band
+lc_max = 1000.0            # Default size far from the band
+
+# Surface remeshing controls
+feature_angle = 0.0       # Feature detection angle (degrees) (40 ?)
+seam_angle = 90.0         # Seam detection angle (degrees) (180 ?)
+# ------------------------------------------------
+
+def _curves_from_physical_lines(ptags: Sequence[int]) -> List[int]:
+    curves: List[int] = []
+    for tag in ptags:
+        for ent in gmsh.model.getEntitiesForPhysicalGroup(1, int(tag)):
+            curves.append(int(ent))
+    return sorted(set(curves))
+
+def _curves_from_surfaces(surface_tags: Sequence[int]) -> List[int]:
+    """Return all boundary curves for the provided surfaces."""
+    curves: set[int] = set()
+    for surface_tag in surface_tags:
+        boundary = gmsh.model.getBoundary([(2, int(surface_tag))], oriented=False, recursive=False)
+        for dim, curve in boundary:
+            if dim == 1:
+                curves.add(int(curve))
+    return sorted(curves)
 
 def readraster(filename):
     """Load a raster with GDAL and write a working copy next to our scripts.
@@ -443,6 +475,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     """
     
     gmsh.initialize()
+    # gmsh.option.setNumber("General.NumThreads", 8)
+    
     
     model = gmsh.model
     model.add("2D")
@@ -665,6 +699,38 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     all_inflow_lines = [tag for dim, tag in all_inflow_lines]
     # Drop dimension indices so we can register the curves directly as a
     # physical line group.
+        # Build distance field along detected curves.
+    curve_tags = _curves_from_physical_lines(phys_line_targets)
+    if not curve_tags:
+        volumes = gmsh.model.getEntities(3)
+        if volumes:
+            boundary = gmsh.model.getBoundary(volumes, oriented=False, recursive=False)
+            surface_tags_after = sorted({tag for dim, tag in boundary if dim == 2})
+        else:
+            surface_tags_after = [tag for (dim, tag) in gmsh.model.getEntities(2)]
+        curve_tags = _curves_from_surfaces(surface_tags_after)
+
+    if not curve_tags:
+        gmsh.finalize()
+        raise RuntimeError("Unable to detect boundary curves for the refinement band.")
+        
+    distance_field = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
+    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", 200)
+
+    threshold_field = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", band_width_min)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", band_width_max)
+
+    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
+    
     
     # Physical groups map mesh regions to boundary conditions in downstream
     # solvers (FEniCS, etc.).  Keep them descriptive so post-processing stays
@@ -680,6 +746,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
   
     model.geo.synchronize()
     model.mesh.generate(2)
+    gmsh.model.mesh.optimize(method="Laplace2D", niter=5)
     
     # Store the XY footprint of important curves so the 3D stage can spot when
     # it is adjusting nodes that lie on the shoreline or grounding line.
@@ -708,19 +775,12 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             xy_grounding.append((x,y))
     
     filename = f"2D_{num_of_layers}_layer_mesh.msh"
-    refine = "refine_band.py"
-
-
-
+   
     gmsh.write(filename)
         
     gmsh.finalize()
 
-    filename_out = "test.msh"
-
-    subprocess.run([sys.executable, str(refine), filename, filename_out])
-
-    mesh2D = (filename_out, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
+    mesh2D = (filename, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
     
     return mesh2D
 
@@ -1104,6 +1164,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         gmsh.option.setNumber("Mesh.Smoothing", 5)
 
     model.mesh.generate(3)
+    model.mesh.optimize(method="Laplace2D", niter=20)
         
     model.mesh.reclassifyNodes()
     model.geo.synchronize()
@@ -1151,14 +1212,15 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     model.geo.synchronize()
     
-    if optimize:
+    # if optimize:
         # Optional smoothing passes (first default, then Netgen) to improve
         # element quality when requested.
-        gmsh.model.mesh.optimize(method="")
+        # gmsh.model.mesh.optimize(method="")
         # gmsh.model.mesh.optimize(method="Lloyd") # Lukas: gave error for me 
-        gmsh.model.mesh.optimize(method="Netgen")
-        model.geo.synchronize()
-        water_node_tags, water_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(3, 5)
+        # gmsh.model.mesh.optimize(method="Netgen")
+        # model.geo.synchronize()
+        # water_node_tags, water_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(3, 5)
+    
     
     filename = f"{folder}{meshname}.msh"
     gmsh.write(filename)
@@ -1330,11 +1392,11 @@ def main():
     
     #Adaptive:
     adaptive = [
-        Scenario(560, 1, 2, True, False, 10),
-        Scenario(470, 1, 2, True, False, 15),
-        Scenario(400, 1, 2, True, False, 20),
-        Scenario(460, 1, 20, True, False, 0),
-        Scenario(190, 6, 2, True, False, 0),
+        Scenario(900, 1, 2, False, True, 10),
+        # Scenario(470, 1, 2, True, False, 15),
+        # Scenario(400, 1, 2, True, False, 20),
+        # Scenario(460, 1, 20, True, False, 0),
+        # Scenario(190, 6, 2, True, False, 0),
     ]
     
     #Combo test:

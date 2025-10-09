@@ -27,8 +27,8 @@ phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
 # Band + sizes (units match the mesh coordinates)
-band_width_min = 100.0     # Distance at which lc_min applies
-band_width_max = 500.0     # Distance where size fades back to lc_max
+band_width_min = 1000.0     # Distance at which lc_min applies
+band_width_max = 2000.0     # Distance where size fades back to lc_max
 lc_min = 200.0              # Fine size inside the band
 lc_max = 1000.0            # Default size far from the band
 
@@ -38,17 +38,23 @@ seam_angle = 90.0         # Seam detection angle (degrees) (180 ?)
 # ------------------------------------------------
 
 
+
 def _prepare_field_data(snapshot: List[Tuple[int, int, str, Iterable[int]]]) -> Dict[str, np.ndarray]:
-    """Return meshio-style field data mapping physical names to (tag, dim)."""
+    """Return meshio-style field data mapping physical names to (tag, dim).
+
+    Includes both 1D (curves) and 2D (surfaces) PhysicalGroups so that
+    the output file preserves those definitions, even if only triangles
+    are exported as cells.
+    """
     field: Dict[str, Tuple[int, int]] = {}
     for dim, tag, name, _ in snapshot:
-        if dim != 2:
+        if dim not in (1, 2):
             continue
         if not name:
             name = f"PhysicalGroup_{tag}"
         base = name
         suffix = 1
-        while name in field and field[name][0] != tag:
+        while name in field and (field[name][0] != tag or field[name][1] != dim):
             name = f"{base}_{suffix}"
             suffix += 1
         field[name] = (int(tag), dim)
@@ -169,6 +175,7 @@ def _surfaces_from_physical_surfaces(ptags: Sequence[int]) -> List[int]:
 
 
 gmsh.initialize()
+gmsh.option.setNumber("General.NumThreads", 8)
 gmsh.option.setNumber("General.Terminal", 1)
 gmsh.open(in_msh)
 
