@@ -7,7 +7,7 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-from typing import NamedTuple, Sequence, List
+from typing import NamedTuple, Sequence, List, Optional
 from pathlib import Path
 import subprocess, sys
 
@@ -35,15 +35,22 @@ phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
 # Band + sizes (units match the mesh coordinates)
-band_width_min = 1000.0     # Distance at which lc_min applies
-band_width_max = 2000.0     # Distance where size fades back to lc_max
-lc_min = 200.0              # Fine size inside the band
+band_width_min = 0.0       # Distance from the boundary that keeps lc_min (0 => lc_min exactly on the boundary)
+band_width_max = 4000.0     # Distance where size transitions back to lc_max (must be > band_width_min)
+lc_min = 50.0             # Fine size inside the band
 lc_max = 1000.0            # Default size far from the band
+distance_sampling = 5    # Sampling density for the distance field along curves
 
-# Surface remeshing controls
-feature_angle = 0.0       # Feature detection angle (degrees) (40 ?)
-seam_angle = 90.0         # Seam detection angle (degrees) (180 ?)
-# ------------------------------------------------
+# 3D mesh quality controls (used when `optimize=True` in generate_mesh_mult)
+volume_quality_target = 0.1       # Lift worst tetrahedra above this quality threshold
+volume_quality_max_passes = 10     # Maximum targeted improvement cycles
+# Keep defaults to methods broadly available across Gmsh builds to avoid
+# "Unknown mesh optimization method" errors. You can extend this tuple if
+# your Gmsh supports additional 3D optimizers.
+volume_quality_methods: Sequence[str] = (
+    "Relocate3D", "Netgen",
+)
+
 
 def _curves_from_physical_lines(ptags: Sequence[int]) -> List[int]:
     curves: List[int] = []
@@ -61,6 +68,118 @@ def _curves_from_surfaces(surface_tags: Sequence[int]) -> List[int]:
             if dim == 1:
                 curves.add(int(curve))
     return sorted(curves)
+
+
+def _min_volume_quality() -> Optional[float]:
+    """Compute a robust mean-ratio quality for all tetrahedra.
+
+    q_tet = 12 * (3 V)^{2/3} / sum_{edges} |e|^2, in [0, 1] for regular tets.
+    Handles 4- and 10-node tets (uses corner nodes for the latter).
+    """
+    try:
+        all_node_tags, all_node_coords, _ = gmsh.model.mesh.getNodes()
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Unable to access nodes for quality check: {err}", file=sys.stderr)
+        return None
+
+    coord = {
+        int(tag): (
+            float(all_node_coords[3 * idx]),
+            float(all_node_coords[3 * idx + 1]),
+            float(all_node_coords[3 * idx + 2]),
+        )
+        for idx, tag in enumerate(all_node_tags)
+    }
+
+    def tet_quality(p0, p1, p2, p3) -> float:
+        v1 = np.array(p1) - np.array(p0)
+        v2 = np.array(p2) - np.array(p0)
+        v3 = np.array(p3) - np.array(p0)
+        vol6 = float(np.dot(v1, np.cross(v2, v3)))
+        V = abs(vol6) / 6.0
+        e01 = np.linalg.norm(np.array(p1) - np.array(p0))**2
+        e02 = np.linalg.norm(np.array(p2) - np.array(p0))**2
+        e03 = np.linalg.norm(np.array(p3) - np.array(p0))**2
+        e12 = np.linalg.norm(np.array(p2) - np.array(p1))**2
+        e13 = np.linalg.norm(np.array(p3) - np.array(p1))**2
+        e23 = np.linalg.norm(np.array(p3) - np.array(p2))**2
+        denom = float(e01 + e02 + e03 + e12 + e13 + e23)
+        if denom <= 1e-30:
+            return 0.0
+        q = float(12.0 * (3.0 * V) ** (2.0 / 3.0) / denom)
+        if q < 0.0:
+            return 0.0
+        if q > 1.0:
+            return 1.0
+        return q
+
+    try:
+        elem_types, elem_tags_list, elem_nodes_list = gmsh.model.mesh.getElements(3)
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Unable to list 3D elements: {err}", file=sys.stderr)
+        return None
+
+    found_any = False
+    worst = float("inf")
+
+    for elem_type, elem_tags, elem_nodes in zip(elem_types, elem_tags_list, elem_nodes_list):
+        _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+        if num_nodes not in (4, 10):
+            continue
+        tags = elem_tags.tolist() if hasattr(elem_tags, "tolist") else list(elem_tags)
+        nodes = elem_nodes.tolist() if hasattr(elem_nodes, "tolist") else list(elem_nodes)
+        step = num_nodes
+        for idx in range(len(tags)):
+            start = idx * step
+            node_ids = [int(n) for n in nodes[start:start + step]]
+            n0, n1, n2, n3 = node_ids[0], node_ids[1], node_ids[2], node_ids[3]
+            try:
+                p0, p1, p2, p3 = coord[n0], coord[n1], coord[n2], coord[n3]
+            except KeyError:
+                continue
+            q = tet_quality(p0, p1, p2, p3)
+            found_any = True
+            if q < worst:
+                worst = q
+
+    return worst if found_any else None
+
+
+def _improve_volume_quality(
+    target: float,
+    max_passes: int,
+    methods: Sequence[str],
+) -> Optional[float]:
+    """Iteratively apply Gmsh 3D optimizers focused on low-quality tets.
+
+    Returns the final minimum quality if available; otherwise ``None``.
+    """
+
+    if target <= 0 or max_passes <= 0:
+        return None
+
+    worst = _min_volume_quality()
+    if worst is None or worst >= target:
+        return worst
+
+    failed_methods: set[str] = set()
+
+    for _ in range(int(max_passes)):
+        if worst is not None and worst >= target:
+            break
+        for method in methods:
+            if method in failed_methods:
+                continue
+            try:
+                gmsh.model.mesh.optimize(method=method, niter=1)
+            except Exception as err:
+                print(f"[ryder_3D_meshing] Skipping optimizer '{method}': {err}", file=sys.stderr)
+                failed_methods.add(method)
+        worst = _min_volume_quality()
+        if worst is None:
+            break
+
+    return worst
 
 def readraster(filename):
     """Load a raster with GDAL and write a working copy next to our scripts.
@@ -475,7 +594,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     """
     
     gmsh.initialize()
-    # gmsh.option.setNumber("General.NumThreads", 8)
+    gmsh.option.setNumber("General.NumThreads", 8)
+    
     
     
     model = gmsh.model
@@ -697,9 +817,10 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     model.geo.synchronize()
     
     all_inflow_lines = [tag for dim, tag in all_inflow_lines]
-    # Drop dimension indices so we can register the curves directly as a
-    # physical line group.
-        # Build distance field along detected curves.
+    # --- Build a boundary-aware size field -----------------------------------
+    # 1. Collect the curve entities that bound the target surfaces. We prefer
+    #    user-provided Physical Line tags but fall back to the geometric
+    #    boundary of the selected surfaces.
     curve_tags = _curves_from_physical_lines(phys_line_targets)
     if not curve_tags:
         volumes = gmsh.model.getEntities(3)
@@ -713,18 +834,33 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     if not curve_tags:
         gmsh.finalize()
         raise RuntimeError("Unable to detect boundary curves for the refinement band.")
-        
+
+    # 2. Evaluate the signed distance to those curves. The field sampling governs
+    #    how finely the distance is interpolated along each curve; increase
+    #    `distance_sampling` if you need a sharper transition.
     distance_field = gmsh.model.mesh.field.add("Distance")
     gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
-    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", 200)
+    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", distance_sampling)
+
+    # 3. Map distance -> element size with a Threshold field. Distances smaller
+    #    than `inner_band` use `lc_min`, distances larger than `outer_band`
+    #    use `lc_max`, and the values in between are linearly interpolated.
+    inner_band = max(0.0, float(band_width_min))  # 0 => lc_min starts exactly on the boundary
+    outer_band = float(band_width_max)
+    if outer_band <= inner_band:
+        gmsh.finalize()
+        raise ValueError("band_width_max must be greater than band_width_min to create a transition zone.")
 
     threshold_field = gmsh.model.mesh.field.add("Threshold")
     gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
     gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
     gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", band_width_min)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", band_width_max)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
 
+    # 4. Install the size field as the new background field so the remesher
+    #    honors the boundary band transition. We disable the default
+    #    characteristic length heuristics so only our size field is used.
     gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
@@ -746,7 +882,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
   
     model.geo.synchronize()
     model.mesh.generate(2)
-    gmsh.model.mesh.optimize(method="Laplace2D", niter=5)
+    # gmsh.model.mesh.optimize(method="Laplace2D", niter=5)
     
     # Store the XY footprint of important curves so the 3D stage can spot when
     # it is adjusting nodes that lie on the shoreline or grounding line.
@@ -821,6 +957,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         meshname = f"A_{meshname}"
     
     gmsh.initialize()
+    gmsh.option.setNumber("General.NumThreads", 8)
+    
     
     model = gmsh.model
     model.add("3D")
@@ -1161,14 +1299,28 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
 
     if optimize:
         # Light Laplacian smoothing when quality tuning is requested.
-        gmsh.option.setNumber("Mesh.Smoothing", 5)
-
-    model.mesh.generate(3)
-    model.mesh.optimize(method="Laplace2D", niter=20)
+        gmsh.option.setNumber("Mesh.Smoothing", 200)
         
+
+    gmsh.option.setNumber("Mesh.Algorithm3D", 4)
+    model.mesh.generate(3)
+
+    final_volume_quality = None
+    if optimize:
+        final_volume_quality = _improve_volume_quality(
+            volume_quality_target,
+            volume_quality_max_passes,
+            volume_quality_methods,
+        )
+
+    model.mesh.removeDuplicateNodes()
+    model.mesh.removeDuplicateElements()
     model.mesh.reclassifyNodes()
     model.geo.synchronize()
     
+    if final_volume_quality is not None:
+        print(f"Volume min quality after targeted optimization: {final_volume_quality:.3f}")
+
     surface_node_tags, surface_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, WATER_SURFACE_TAG)
     ice_node_tags, ice_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, ICE_TAG)
     bath_node_tags, bath_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(2, BATHYMETRY_TAG)
@@ -1382,17 +1534,17 @@ def main():
     #Stacked:
      
     stacked = [
-        Scenario(730, 1, 2, False, False, 10),
-        Scenario(560, 1, 2, False, False, 15),
-        Scenario(480, 1, 2, False, False, 20),
-        Scenario(450, 1, 2, False, False, 25),
-        Scenario(310, 1, 2, False, False, 50),
-        Scenario(255, 1, 2, False, False, 75),
+        Scenario(730, 1, 9, False, False, 0),
+        # Scenario(560, 1, 2, False, False, 15),
+        # Scenario(480, 1, 2, False, False, 20),
+        # Scenario(450, 1, 2, False, False, 25),
+        # Scenario(310, 1, 2, False, False, 50),
+        # Scenario(255, 1, 2, False, False, 75),
     ]
     
     #Adaptive:
     adaptive = [
-        Scenario(900, 1, 2, False, True, 10),
+        Scenario(560, 1, 2, False, True, 15),
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
         # Scenario(460, 1, 20, True, False, 0),
