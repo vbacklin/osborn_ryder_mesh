@@ -8,6 +8,10 @@ from osgeo_utils import gdal_calc
 import shutil
 import gmsh
 from typing import NamedTuple
+from pathlib import Path
+import subprocess, sys
+
+
 # plt.style.use('seaborn-v0_8')
 gdal.UseExceptions()
 
@@ -704,12 +708,19 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             xy_grounding.append((x,y))
     
     filename = f"2D_{num_of_layers}_layer_mesh.msh"
-    
+    refine = "refine_band.py"
+
+
+
     gmsh.write(filename)
         
     gmsh.finalize()
-    
-    mesh2D = (filename, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
+
+    filename_out = "test.msh"
+
+    subprocess.run([sys.executable, str(refine), filename, filename_out])
+
+    mesh2D = (filename_out, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
     
     return mesh2D
 
