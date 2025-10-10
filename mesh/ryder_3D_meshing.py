@@ -21,6 +21,7 @@ BATHYMETRY_TAG = 2
 INFLOW_TAG = 4
 INFLOW_LINE_TAG = 3
 SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
+GMESH_NUM_THREADS = 8
 ROTATE_X_DEGREES = 90
 ROTATE_Y_DEGREES = -116
 ROTATE_X_RAD = math.radians(ROTATE_X_DEGREES)
@@ -34,22 +35,44 @@ ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
 phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
-# Band + sizes (units match the mesh coordinates)
-band_width_min = 0.0       # Distance from the boundary that keeps lc_min (0 => lc_min exactly on the boundary)
-band_width_max = 4000.0     # Distance where size transitions back to lc_max (must be > band_width_min)
-lc_min = 50.0             # Fine size inside the band
-lc_max = 1000.0            # Default size far from the band
-distance_sampling = 5    # Sampling density for the distance field along curves
+# --- Mesh sizing and quality parameters (easy to tweak) ----------------------
 
-# 3D mesh quality controls (used when `optimize=True` in generate_mesh_mult)
-volume_quality_target = 0.1       # Lift worst tetrahedra above this quality threshold
-volume_quality_max_passes = 10     # Maximum targeted improvement cycles
-# Keep defaults to methods broadly available across Gmsh builds to avoid
-# "Unknown mesh optimization method" errors. You can extend this tuple if
-# your Gmsh supports additional 3D optimizers.
-volume_quality_methods: Sequence[str] = (
-    "Relocate3D", "Netgen",
+# Shoreline-aware size band (units match mesh coordinates)
+BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
+BAND_WIDTH_MAX = 4000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
+LC_MIN = 1000.0               # Fine element size inside the refinement band
+LC_MAX = 1000.0               # Default element size far from the refinement band
+DISTANCE_SAMPLING = 5         # Distance field sampling density along curves
+
+# 3D volumetric quality targets (used when optimize=True)
+VOLUME_QUALITY_TARGET = 0.3        # Minimum acceptable mean-ratio quality after optimization
+VOLUME_QUALITY_MAX_PASSES = 1      # Maximum targeted optimization passes
+VOLUME_QUALITY_METHODS: Sequence[str] = (
+    "",             # Default tetra optimizer (general smoothing)
+    "Relocate3D",   # 3D node relocation smoothing
 )
+
+# Optional global smoothing / robustness tweaks
+MESH_SMOOTHING_ITERS = 500
+INITIAL_DELAUNAY_TOL = 1e-13
+MESH_ALGORITHM3D_QUALITY = 4   # Frontal 3D
+
+# Local refinement configuration
+LOCAL_REFINE_DEFAULT_ENABLED = True
+LOCAL_REFINE_THRESHOLD_DEFAULT = 0.2
+LOCAL_REFINE_MAX_CYCLES_DEFAULT = 5
+LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT = -1
+LOCAL_REFINE_MAX_BAD_FRACTION = 0.005
+LOCAL_REFINE_MAX_SEED_NODES = 20000
+LOCAL_REFINE_INNER_RADIUS_FACTOR = 5.0
+LOCAL_REFINE_OUTER_RADIUS_FACTOR = 10.0
+LOCAL_REFINE_SIZE_MIN_FACTOR = 0.001
+LOCAL_REFINE_DISTANCE_SAMPLING = 100
+
+# 2D boundary distance-field controls
+BOUNDARY_FIELD_SAMPLING = 50
+BOUNDARY_FIELD_DIST_MIN = 0.01
+BOUNDARY_FIELD_DIST_MAX = 10.0
 
 
 def _curves_from_physical_lines(ptags: Sequence[int]) -> List[int]:
@@ -180,6 +203,150 @@ def _improve_volume_quality(
             break
 
     return worst
+
+
+def _local_refine_bad_regions(
+    base_size: float,
+    quality_threshold: float = LOCAL_REFINE_THRESHOLD_DEFAULT,
+    max_bad_fraction: float = LOCAL_REFINE_MAX_BAD_FRACTION,
+    max_seed_nodes: int = LOCAL_REFINE_MAX_SEED_NODES,
+    inner_radius_factor: float = LOCAL_REFINE_INNER_RADIUS_FACTOR,
+    outer_radius_factor: float = LOCAL_REFINE_OUTER_RADIUS_FACTOR,
+    size_min_factor: float = LOCAL_REFINE_SIZE_MIN_FACTOR,
+) -> Optional[int]:
+    """Install a background size field around the worst-quality tets and remesh.
+
+    Returns number of seed nodes used (0 if none), or None on failure.
+    """
+
+    print(f"[local-refine] Start: base_size={base_size}, threshold={quality_threshold}, max_bad_fraction={max_bad_fraction}, max_seed_nodes={max_seed_nodes}")
+
+    try:
+        elem_types, elem_tags_list, elem_nodes_list = gmsh.model.mesh.getElements(3)
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Unable to list 3D elements for local refine: {err}", file=sys.stderr)
+        return None
+
+    per_elem_nodes: dict[int, List[int]] = {}
+    all_elem_tags: List[int] = []
+
+    for etype, tags, nodes in zip(elem_types, elem_tags_list, elem_nodes_list):
+        try:
+            _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(etype)
+        except Exception:
+            continue
+        if num_nodes not in (4, 10):
+            continue
+        tag_list = tags.tolist() if hasattr(tags, "tolist") else list(tags)
+        node_list = nodes.tolist() if hasattr(nodes, "tolist") else list(nodes)
+        for i, tag in enumerate(tag_list):
+            start = i * num_nodes
+            elem_nodes = [int(n) for n in node_list[start:start + num_nodes]]
+            per_elem_nodes[int(tag)] = elem_nodes
+        all_elem_tags.extend(int(t) for t in tag_list)
+
+    if not all_elem_tags:
+        print("[local-refine] No 3D elements found; skipping.")
+        return 0
+
+    try:
+        qualities = gmsh.model.mesh.getElementQualities(all_elem_tags, qualityName="gamma")
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Element quality computation failed: {err}", file=sys.stderr)
+        return None
+
+    # Normalize to a plain Python list for robust handling
+    qual_list = qualities.tolist() if hasattr(qualities, "tolist") else list(qualities)
+
+    # Report baseline quality statistics before refinement
+    q_min = float(min(qual_list)) if len(qual_list) > 0 else float("inf")
+    q_avg = float(sum(qual_list) / len(qual_list)) if len(qual_list) > 0 else float("nan")
+    mr_before = _min_volume_quality()
+    print(f"[local-refine] Elements: {len(all_elem_tags)}; min gamma={q_min:.4f}; avg gamma={q_avg:.4f}; min mean-ratio={('n/a' if mr_before is None else f'{mr_before:.4f}')}\n[local-refine] Selecting elements with gamma < {quality_threshold} (cap {int(len(all_elem_tags) * float(max_bad_fraction))})")
+
+    tag_quality = list(zip(all_elem_tags, qual_list))
+    tag_quality.sort(key=lambda tq: float(tq[1]))
+
+    max_bad = max(1, int(len(tag_quality) * float(max_bad_fraction)))
+    selected: List[int] = []
+    for tag, q in tag_quality:
+        if float(q) < float(quality_threshold):
+            selected.append(int(tag))
+            if len(selected) >= max_bad:
+                break
+        else:
+            break
+
+    if not selected:
+        print("[local-refine] Nothing below threshold; skipping.")
+        return 0
+
+    seed_nodes: List[int] = []
+    seen: set[int] = set()
+    for tag in selected:
+        for n in per_elem_nodes.get(tag, []):
+            if n not in seen:
+                seen.add(n)
+                seed_nodes.append(n)
+                if len(seed_nodes) >= int(max_seed_nodes):
+                    break
+        if len(seed_nodes) >= int(max_seed_nodes):
+            break
+
+    if not seed_nodes:
+        print("[local-refine] No seed nodes collected; skipping.")
+        return 0
+
+    r_in = max(1.0, float(inner_radius_factor) * float(base_size))
+    r_out = max(r_in + 1.0, float(outer_radius_factor) * float(base_size))
+    size_min = max(1.0, float(size_min_factor) * float(base_size))
+    size_max = max(size_min, float(base_size))
+
+    print(f"[local-refine] Selected bad elements: {len(selected)}; seed nodes: {len(seed_nodes)}")
+    print(f"[local-refine] Band radii: r_in={r_in:.2f}, r_out={r_out:.2f}; target sizes: min={size_min:.2f}, max={size_max:.2f}")
+
+    try:
+        fdist = gmsh.model.mesh.field.add("Distance")
+        gmsh.model.mesh.field.setNumbers(fdist, "NodesList", seed_nodes)
+        gmsh.model.mesh.field.setNumber(fdist, "Sampling", LOCAL_REFINE_DISTANCE_SAMPLING)
+
+        fthr = gmsh.model.mesh.field.add("Threshold")
+        gmsh.model.mesh.field.setNumber(fthr, "InField", fdist)
+        gmsh.model.mesh.field.setNumber(fthr, "SizeMin", size_min)
+        gmsh.model.mesh.field.setNumber(fthr, "SizeMax", size_max)
+        gmsh.model.mesh.field.setNumber(fthr, "DistMin", r_in)
+        gmsh.model.mesh.field.setNumber(fthr, "DistMax", r_out)
+
+        gmsh.model.mesh.field.setAsBackgroundMesh(fthr)
+        print("[local-refine] Background size field installed.")
+        
+        # 4. Install the size field as the new background field so the remesher
+        #    honors the boundary band transition. We disable the default
+        #    characteristic length heuristics so only our size field is used.
+        # gmsh.model.mesh.field.setAsBackgroundMesh(fthr)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Local refine field setup failed: {err}", file=sys.stderr)
+        return None
+
+    try:
+        print("[local-refine] Remeshing 3D ...")
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.removeDuplicateNodes()
+        gmsh.model.mesh.removeDuplicateElements()
+        gmsh.model.mesh.reclassifyNodes()
+        gmsh.model.geo.synchronize()
+        # Report post-remesh quality
+        mr_after = _min_volume_quality()
+        print(f"[local-refine] Done. min mean-ratio before={('n/a' if mr_before is None else f'{mr_before:.4f}')}, after={('n/a' if mr_after is None else f'{mr_after:.4f}')}.")
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Remeshing after local refine failed: {err}", file=sys.stderr)
+        return None
+
+    return len(seed_nodes)
 
 def readraster(filename):
     """Load a raster with GDAL and write a working copy next to our scripts.
@@ -594,7 +761,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     """
     
     gmsh.initialize()
-    gmsh.option.setNumber("General.NumThreads", 8)
+    gmsh.option.setNumber("General.NumThreads", GMESH_NUM_THREADS)
     
     
     
@@ -723,14 +890,14 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         field_api = gmsh.model.mesh.field
         distance_field = field_api.add("Distance")
         field_api.setNumbers(distance_field, "CurvesList", sorted(boundary_curve_tags))
-        field_api.setNumber(distance_field, "Sampling", 50)
+        field_api.setNumber(distance_field, "Sampling", BOUNDARY_FIELD_SAMPLING)
 
         boundary_field = field_api.add("Threshold")
         field_api.setNumber(boundary_field, "IField", distance_field)
         field_api.setNumber(boundary_field, "LcMin", sizes[0])
         field_api.setNumber(boundary_field, "LcMax", sizes[2])
-        field_api.setNumber(boundary_field, "DistMin", float(0.01))
-        field_api.setNumber(boundary_field, "DistMax", float(10.0))
+        field_api.setNumber(boundary_field, "DistMin", float(BOUNDARY_FIELD_DIST_MIN))
+        field_api.setNumber(boundary_field, "DistMax", float(BOUNDARY_FIELD_DIST_MAX))
         field_api.setAsBackgroundMesh(boundary_field)
 
     model.mesh.generate(2)
@@ -835,37 +1002,37 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         gmsh.finalize()
         raise RuntimeError("Unable to detect boundary curves for the refinement band.")
 
-    # 2. Evaluate the signed distance to those curves. The field sampling governs
-    #    how finely the distance is interpolated along each curve; increase
-    #    `distance_sampling` if you need a sharper transition.
-    distance_field = gmsh.model.mesh.field.add("Distance")
-    gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
-    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", distance_sampling)
+    # # 2. Evaluate the signed distance to those curves. The field sampling governs
+    # #    how finely the distance is interpolated along each curve; increase
+    # #    `distance_sampling` if you need a sharper transition.
+    # distance_field = gmsh.model.mesh.field.add("Distance")
+    # gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
+    # gmsh.model.mesh.field.setNumber(distance_field, "Sampling", distance_sampling)
 
-    # 3. Map distance -> element size with a Threshold field. Distances smaller
-    #    than `inner_band` use `lc_min`, distances larger than `outer_band`
-    #    use `lc_max`, and the values in between are linearly interpolated.
-    inner_band = max(0.0, float(band_width_min))  # 0 => lc_min starts exactly on the boundary
-    outer_band = float(band_width_max)
-    if outer_band <= inner_band:
-        gmsh.finalize()
-        raise ValueError("band_width_max must be greater than band_width_min to create a transition zone.")
+    # # 3. Map distance -> element size with a Threshold field. Distances smaller
+    # #    than `inner_band` use `lc_min`, distances larger than `outer_band`
+    # #    use `lc_max`, and the values in between are linearly interpolated.
+    # inner_band = max(0.0, float(band_width_min))  # 0 => lc_min starts exactly on the boundary
+    # outer_band = float(band_width_max)
+    # if outer_band <= inner_band:
+    #     gmsh.finalize()
+    #     raise ValueError("band_width_max must be greater than band_width_min to create a transition zone.")
 
-    threshold_field = gmsh.model.mesh.field.add("Threshold")
-    gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
-    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
-    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
+    # threshold_field = gmsh.model.mesh.field.add("Threshold")
+    # gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
+    # gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
+    # gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
+    # gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
+    # gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
 
-    # 4. Install the size field as the new background field so the remesher
-    #    honors the boundary band transition. We disable the default
-    #    characteristic length heuristics so only our size field is used.
-    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
+    # # 4. Install the size field as the new background field so the remesher
+    # #    honors the boundary band transition. We disable the default
+    # #    characteristic length heuristics so only our size field is used.
+    # gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+    # gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+    # gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    # gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
+    # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
     
     
     # Physical groups map mesh regions to boundary conditions in downstream
@@ -923,7 +1090,11 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
 def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data, 
                        bathymetry_data, highres_data, thickness_data, surface_pos_data, 
                        scale = 1, num_of_layers = 2, adapt = False, adaptive_scales = (1/4, 2),
-                       optimize = False, stack = 25, interpolate = True):
+                       optimize = False, stack = 25, interpolate = True,
+                       local_refine: bool = LOCAL_REFINE_DEFAULT_ENABLED,
+                       local_refine_threshold: Optional[float] = LOCAL_REFINE_THRESHOLD_DEFAULT,
+                       local_refine_max_cycles: int = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
+                       local_refine_min_improvement: float = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT):
     """Extrude the 2D surface mesh into 3D and sculpt it with raster data."""
     
     if num_of_layers > 2:
@@ -957,7 +1128,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         meshname = f"A_{meshname}"
     
     gmsh.initialize()
-    gmsh.option.setNumber("General.NumThreads", 8)
+    gmsh.option.setNumber("General.NumThreads", GMESH_NUM_THREADS)
     
     
     model = gmsh.model
@@ -1293,25 +1464,65 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
 
     if num_of_layers > 2:
         if num_of_layers in [15] or (num_of_layers in [20] and adapt):
-            gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", 1e-13)
+            gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", INITIAL_DELAUNAY_TOL)
         if scale > 1:
-            gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", 1e-13)
+            gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", INITIAL_DELAUNAY_TOL)
 
     if optimize:
         # Light Laplacian smoothing when quality tuning is requested.
-        gmsh.option.setNumber("Mesh.Smoothing", 200)
-        
+        gmsh.option.setNumber("Mesh.Smoothing", MESH_SMOOTHING_ITERS)
+    # Prefer quality-oriented 3D algorithm when tuning quality or local refine.
+    if optimize or local_refine:
+        try:
+            gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM3D_QUALITY)
+            print(f"[3D] Using Mesh.Algorithm3D = {MESH_ALGORITHM3D_QUALITY} (quality-oriented)")
+        except Exception:
+            print("[3D] Could not set Mesh.Algorithm3D; proceeding with default.")
 
-    gmsh.option.setNumber("Mesh.Algorithm3D", 4)
     model.mesh.generate(3)
 
     final_volume_quality = None
     if optimize:
         final_volume_quality = _improve_volume_quality(
-            volume_quality_target,
-            volume_quality_max_passes,
-            volume_quality_methods,
+            VOLUME_QUALITY_TARGET,
+            VOLUME_QUALITY_MAX_PASSES,
+            VOLUME_QUALITY_METHODS,
         )
+
+    # Optional: locally refine around worst-quality tets, then re-optimize (multi-cycle).
+    if (optimize and local_refine):
+        threshold = float(local_refine_threshold) if local_refine_threshold is not None else float(VOLUME_QUALITY_TARGET)
+        cycles = max(1, int(local_refine_max_cycles))
+        current_q = final_volume_quality if final_volume_quality is not None else _min_volume_quality()
+        print(f"[local-refine] Requested with threshold={threshold}. Current min mean-ratio={('n/a' if current_q is None else f'{current_q:.4f}')}. Max cycles={cycles}.")
+        last_q = current_q if current_q is not None else 0.0
+        for c in range(1, cycles + 1):
+            if current_q is not None and current_q >= threshold:
+                print(f"[local-refine] Target reached (min={current_q:.4f} >= {threshold}). Stopping at cycle {c-1}.")
+                break
+            print(f"[local-refine] Cycle {c}/{cycles}: refining regions below {threshold} ...")
+            seeds = _local_refine_bad_regions(
+                base_size=float(m),
+                quality_threshold=float(threshold),
+            )
+            if not seeds:
+                print("[local-refine] No seeds applied in this cycle; stopping further refinement.")
+                break
+            print(f"[local-refine] Seeds used in cycle {c}: {seeds}. Re-running optimizer ...")
+            final_volume_quality = _improve_volume_quality(
+                VOLUME_QUALITY_TARGET,
+                VOLUME_QUALITY_MAX_PASSES,
+                VOLUME_QUALITY_METHODS,
+            )
+            current_q = final_volume_quality if final_volume_quality is not None else _min_volume_quality()
+            if current_q is None:
+                print("[local-refine] Could not evaluate quality after optimization; stopping.")
+                break
+            print(f"[local-refine] After cycle {c}: min mean-ratio={current_q:.4f} (prev={('n/a' if last_q is None else f'{last_q:.4f}')}).")
+            if local_refine_min_improvement > 0 and last_q is not None and (current_q - last_q) < float(local_refine_min_improvement):
+                print(f"[local-refine] Improvement {current_q - last_q:.4e} < {local_refine_min_improvement}; stopping early.")
+                break
+            last_q = current_q
 
     model.mesh.removeDuplicateNodes()
     model.mesh.removeDuplicateElements()
@@ -1544,7 +1755,7 @@ def main():
     
     #Adaptive:
     adaptive = [
-        Scenario(560, 1, 2, False, True, 15),
+        Scenario(1000, 1, 2, False, True, 30),
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
         # Scenario(460, 1, 20, True, False, 0),
@@ -1565,7 +1776,11 @@ def main():
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
-                                 stack = scenario.stack, interpolate = True)
+                                 stack = scenario.stack, interpolate = True,
+                                 local_refine = LOCAL_REFINE_DEFAULT_ENABLED,
+                                 local_refine_threshold = LOCAL_REFINE_THRESHOLD_DEFAULT,
+                                 local_refine_max_cycles = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
+                                 local_refine_min_improvement = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT)
         dofs.append((meshname, dof))
     
     for meshname, dof in dofs:
