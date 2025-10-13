@@ -39,10 +39,10 @@ phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
-BAND_WIDTH_MAX = 4000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 1000.0               # Fine element size inside the refinement band
-LC_MAX = 1000.0               # Default element size far from the refinement band
-DISTANCE_SAMPLING = 5         # Distance field sampling density along curves
+BAND_WIDTH_MAX = 2000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
+LC_MIN = 500.0               # Fine element size inside the refinement band
+LC_MAX = 500.0               # Default element size far from the refinement band
+DISTANCE_SAMPLING = 20         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
 VOLUME_QUALITY_TARGET = 0.3        # Minimum acceptable mean-ratio quality after optimization
@@ -332,7 +332,7 @@ def _local_refine_bad_regions(
         # gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
         # gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
         # gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
+        # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", LC_MAX)
     except Exception as err:
         print(f"[ryder_3D_meshing] Local refine field setup failed: {err}", file=sys.stderr)
         return None
@@ -1017,37 +1017,37 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         gmsh.finalize()
         raise RuntimeError("Unable to detect boundary curves for the refinement band.")
 
-    # # 2. Evaluate the signed distance to those curves. The field sampling governs
-    # #    how finely the distance is interpolated along each curve; increase
-    # #    `distance_sampling` if you need a sharper transition.
-    # distance_field = gmsh.model.mesh.field.add("Distance")
-    # gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
-    # gmsh.model.mesh.field.setNumber(distance_field, "Sampling", distance_sampling)
+    # 2. Evaluate the signed distance to those curves. The field sampling governs
+    #    how finely the distance is interpolated along each curve; increase
+    #    `DISTANCE_SAMPLING` if you need a sharper transition.
+    distance_field = gmsh.model.mesh.field.add("Distance")
+    gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
+    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", DISTANCE_SAMPLING)
 
-    # # 3. Map distance -> element size with a Threshold field. Distances smaller
-    # #    than `inner_band` use `lc_min`, distances larger than `outer_band`
-    # #    use `lc_max`, and the values in between are linearly interpolated.
-    # inner_band = max(0.0, float(band_width_min))  # 0 => lc_min starts exactly on the boundary
-    # outer_band = float(band_width_max)
-    # if outer_band <= inner_band:
-    #     gmsh.finalize()
-    #     raise ValueError("band_width_max must be greater than band_width_min to create a transition zone.")
+    # 3. Map distance -> element size with a Threshold field. Distances smaller
+    #    than `inner_band` use `LC_MIN`, distances larger than `outer_band`
+    #    use `LC_MAX`, and the values in between are linearly interpolated.
+    inner_band = max(0.0, float(BAND_WIDTH_MIN))  # 0 => LC_MIN starts exactly on the boundary
+    outer_band = float(BAND_WIDTH_MAX)
+    if outer_band <= inner_band:
+        gmsh.finalize()
+        raise ValueError("BAND_WIDTH_MAX must be greater than BAND_WIDTH_MIN to create a transition zone.")
 
-    # threshold_field = gmsh.model.mesh.field.add("Threshold")
-    # gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
-    # gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
-    # gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
-    # gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
-    # gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
+    threshold_field = gmsh.model.mesh.field.add("Threshold")
+    gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", LC_MIN)
+    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", LC_MAX)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
+    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
 
-    # # 4. Install the size field as the new background field so the remesher
-    # #    honors the boundary band transition. We disable the default
-    # #    characteristic length heuristics so only our size field is used.
-    # gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
-    # gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
-    # gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
-    # gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
-    # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
+    # 4. Install the size field as the new background field so the remesher
+    #    honors the boundary band transition. We disable the default
+    #    characteristic length heuristics so only our size field is used.
+    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", LC_MAX)
     
     
     # Physical groups map mesh regions to boundary conditions in downstream
@@ -1777,7 +1777,7 @@ def main():
     
     #Adaptive:
     adaptive = [
-        Scenario(200, 1, 2, False, True, 0), # unstructured
+        Scenario(50, 1, 2, False, True, 0), # unstructured
         # Scenario(560, 1, 2, False, False, 15), # stacked fine
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
@@ -1796,7 +1796,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -100, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -LC_MIN/1.0, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 

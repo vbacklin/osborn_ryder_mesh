@@ -30,3 +30,6 @@ Info    : Done optimizing mesh (Wall 1.06856s, CPU 1.06847s)
 #  use ball field = no effect
 # --point-radius-mult = no effect
 # --worst-frac = converges faster to same thing?
+
+
+okay so i am looping through all points and doing setNode() on all points. can you write a simple script that also updates the mesh size somehow (with an additional command or anything you like). i would like the mesh size to be proportional to aspect ratio between 
