@@ -24,3 +24,9 @@ Info    : 0.70 < quality < 0.80 :     33771 elements
 Info    : 0.80 < quality < 0.90 :     19000 elements
 Info    : 0.90 < quality < 1.00 :      4970 elements
 Info    : Done optimizing mesh (Wall 1.06856s, CPU 1.06847s)
+
+
+# hmin = no effect
+#  use ball field = no effect
+# --point-radius-mult = no effect
+# --worst-frac = converges faster to same thing?

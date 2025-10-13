@@ -53,26 +53,31 @@ VOLUME_QUALITY_METHODS: Sequence[str] = (
 )
 
 # Optional global smoothing / robustness tweaks
-MESH_SMOOTHING_ITERS = 500
+MESH_SMOOTHING_ITERS = 5
 INITIAL_DELAUNAY_TOL = 1e-13
 MESH_ALGORITHM3D_QUALITY = 4   # Frontal 3D
 
 # Local refinement configuration
-LOCAL_REFINE_DEFAULT_ENABLED = True
-LOCAL_REFINE_THRESHOLD_DEFAULT = 0.2
-LOCAL_REFINE_MAX_CYCLES_DEFAULT = 5
+LOCAL_REFINE_DEFAULT_ENABLED = False
+LOCAL_REFINE_THRESHOLD_DEFAULT = 0.01
+LOCAL_REFINE_MAX_CYCLES_DEFAULT = 1
 LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT = -1
-LOCAL_REFINE_MAX_BAD_FRACTION = 0.005
-LOCAL_REFINE_MAX_SEED_NODES = 20000
-LOCAL_REFINE_INNER_RADIUS_FACTOR = 5.0
-LOCAL_REFINE_OUTER_RADIUS_FACTOR = 10.0
-LOCAL_REFINE_SIZE_MIN_FACTOR = 0.001
-LOCAL_REFINE_DISTANCE_SAMPLING = 100
+LOCAL_REFINE_MAX_BAD_FRACTION = 0.01
+LOCAL_REFINE_MAX_SEED_NODES = 4000
+LOCAL_REFINE_INNER_RADIUS_FACTOR = 2.5
+LOCAL_REFINE_OUTER_RADIUS_FACTOR = 100.0
+LOCAL_REFINE_SIZE_MIN_FACTOR = 0.01
+LOCAL_REFINE_DISTANCE_SAMPLING = 500
+LOCAL_REFINE_THRESHOLD_DECAY = 0.1
+LOCAL_REFINE_QUALITY_MARGIN = 0.01
+LOCAL_REFINE_BASE_SIZE_SCALE = 0.6
+LOCAL_REFINE_RESET_BACKGROUND = True
 
 # 2D boundary distance-field controls
 BOUNDARY_FIELD_SAMPLING = 50
 BOUNDARY_FIELD_DIST_MIN = 0.01
 BOUNDARY_FIELD_DIST_MAX = 10.0
+reset_background = LOCAL_REFINE_RESET_BACKGROUND
 
 
 def _curves_from_physical_lines(ptags: Sequence[int]) -> List[int]:
@@ -345,6 +350,16 @@ def _local_refine_bad_regions(
     except Exception as err:
         print(f"[ryder_3D_meshing] Remeshing after local refine failed: {err}", file=sys.stderr)
         return None
+    finally:
+        if reset_background:
+            try:
+                gmsh.model.mesh.field.remove(fthr)
+            except Exception:
+                pass
+            try:
+                gmsh.model.mesh.field.remove(fdist)
+            except Exception:
+                pass
 
     return len(seed_nodes)
 
@@ -1491,19 +1506,21 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
 
     # Optional: locally refine around worst-quality tets, then re-optimize (multi-cycle).
     if (optimize and local_refine):
-        threshold = float(local_refine_threshold) if local_refine_threshold is not None else float(VOLUME_QUALITY_TARGET)
+        refine_threshold = float(local_refine_threshold) if local_refine_threshold is not None else float(VOLUME_QUALITY_TARGET)
         cycles = max(1, int(local_refine_max_cycles))
         current_q = final_volume_quality if final_volume_quality is not None else _min_volume_quality()
-        print(f"[local-refine] Requested with threshold={threshold}. Current min mean-ratio={('n/a' if current_q is None else f'{current_q:.4f}')}. Max cycles={cycles}.")
+        print(f"[local-refine] Requested with threshold={refine_threshold}. Current min mean-ratio={('n/a' if current_q is None else f'{current_q:.4f}')}. Max cycles={cycles}.")
         last_q = current_q if current_q is not None else 0.0
         for c in range(1, cycles + 1):
-            if current_q is not None and current_q >= threshold:
-                print(f"[local-refine] Target reached (min={current_q:.4f} >= {threshold}). Stopping at cycle {c-1}.")
+            if current_q is not None and current_q >= refine_threshold:
+                print(f"[local-refine] Target reached (min={current_q:.4f} >= {refine_threshold}). Stopping at cycle {c-1}.")
                 break
-            print(f"[local-refine] Cycle {c}/{cycles}: refining regions below {threshold} ...")
+            cycle_threshold = max((current_q or 0.0) + LOCAL_REFINE_QUALITY_MARGIN, refine_threshold)
+            cycle_base_size = max(1.0, float(m) * (LOCAL_REFINE_BASE_SIZE_SCALE ** (c - 1)))
+            print(f"[local-refine] Cycle {c}/{cycles}: refining regions below {cycle_threshold:.4f} (base_size={cycle_base_size:.2f}) ...")
             seeds = _local_refine_bad_regions(
-                base_size=float(m),
-                quality_threshold=float(threshold),
+                base_size=cycle_base_size,
+                quality_threshold=float(cycle_threshold),
             )
             if not seeds:
                 print("[local-refine] No seeds applied in this cycle; stopping further refinement.")
@@ -1518,11 +1535,16 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             if current_q is None:
                 print("[local-refine] Could not evaluate quality after optimization; stopping.")
                 break
-            print(f"[local-refine] After cycle {c}: min mean-ratio={current_q:.4f} (prev={('n/a' if last_q is None else f'{last_q:.4f}')}).")
-            if local_refine_min_improvement > 0 and last_q is not None and (current_q - last_q) < float(local_refine_min_improvement):
-                print(f"[local-refine] Improvement {current_q - last_q:.4e} < {local_refine_min_improvement}; stopping early.")
+            improvement = current_q - (last_q if last_q is not None else 0.0)
+            print(f"[local-refine] After cycle {c}: min mean-ratio={current_q:.4f} (prev={('n/a' if last_q is None else f'{last_q:.4f}')}); Δ={improvement:.4e}.")
+            # if improvement <= 0:
+            #     print("[local-refine] No improvement observed; stopping further refinement.")
+            #     break
+            if local_refine_min_improvement > 0 and improvement < float(local_refine_min_improvement):
+                print(f"[local-refine] Improvement {improvement:.4e} < {local_refine_min_improvement}; stopping early.")
                 break
             last_q = current_q
+            refine_threshold = max(current_q + LOCAL_REFINE_QUALITY_MARGIN, refine_threshold * LOCAL_REFINE_THRESHOLD_DECAY)
 
     model.mesh.removeDuplicateNodes()
     model.mesh.removeDuplicateElements()
@@ -1745,7 +1767,7 @@ def main():
     #Stacked:
      
     stacked = [
-        Scenario(730, 1, 9, False, False, 0),
+        # Scenario(560, 1, 2, False, False, 15),
         # Scenario(560, 1, 2, False, False, 15),
         # Scenario(480, 1, 2, False, False, 20),
         # Scenario(450, 1, 2, False, False, 25),
@@ -1755,7 +1777,9 @@ def main():
     
     #Adaptive:
     adaptive = [
-        Scenario(1000, 1, 2, False, True, 30),
+        Scenario(200, 1, 2, False, True, 0), # unstructured
+        # Scenario(560, 1, 2, False, False, 15), # stacked fine
+        # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
         # Scenario(460, 1, 20, True, False, 0),
@@ -1772,7 +1796,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -1, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -100, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 

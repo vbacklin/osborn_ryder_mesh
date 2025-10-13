@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
 import gmsh
 import meshio
@@ -27,14 +27,21 @@ phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
 # Band + sizes (units match the mesh coordinates)
-band_width_min = 1000.0     # Distance at which lc_min applies
-band_width_max = 2000.0     # Distance where size fades back to lc_max
-lc_min = 200.0              # Fine size inside the band
+band_width_min = 0.0       # Distance from the boundary that keeps lc_min (0 => lc_min exactly on the boundary)
+band_width_max = 4000.0     # Distance where size transitions back to lc_max (must be > band_width_min)
+lc_min = 50.0             # Fine size inside the band
 lc_max = 1000.0            # Default size far from the band
 
 # Surface remeshing controls
-feature_angle = 0.0       # Feature detection angle (degrees) (40 ?)
-seam_angle = 90.0         # Seam detection angle (degrees) (180 ?)
+feature_angle = 0.0        # Feature detection angle (degrees) (40 ?)
+seam_angle = 90.0          # Seam detection angle (degrees) (180 ?)
+distance_sampling = 5    # Sampling density for the distance field along curves
+optimize_iterations = 1    # Laplacian smoothing iterations after remeshing (0 disables smoothing)
+quality_target = 0.1       # Aim to raise the worst triangle quality above this threshold
+quality_max_passes = 5     # Maximum improvement passes targeting poor-quality elements
+# Optimizer sequence for surface cleanup. Keep methods widely supported
+# across Gmsh versions to avoid "unknown method" errors.
+quality_methods: Sequence[str] = ("Relocate2D", "Laplace2D")
 # ------------------------------------------------
 
 
@@ -147,6 +154,110 @@ def _assign_tags(
     return phys_out, geom_out
 
 
+def _min_surface_quality() -> Optional[float]:
+    """Return the minimum triangle 'equilateral' quality computed geometrically.
+
+    Uses q = 4*sqrt(3)*A / (a^2 + b^2 + c^2) in [0, 1].
+    Quads are split into two triangles consistently with export.
+    """
+    def tri_quality(p0, p1, p2) -> float:
+        v1 = np.array(p1) - np.array(p0)
+        v2 = np.array(p2) - np.array(p0)
+        a = float(np.linalg.norm(v1))
+        b = float(np.linalg.norm(np.array(p2) - np.array(p1)))
+        c = float(np.linalg.norm(np.array(p0) - np.array(p2)))
+        area = 0.5 * float(np.linalg.norm(np.cross(v1, v2)))
+        denom = a*a + b*b + c*c
+        if denom <= 1e-30:
+            return 0.0
+        return float(4.0 * math.sqrt(3.0) * area / denom)
+
+    try:
+        all_node_tags, all_node_coords, _ = gmsh.model.mesh.getNodes()
+    except Exception as err:
+        print(f"[refine_band] Unable to access nodes for quality check: {err}", file=sys.stderr)
+        return None
+
+    coord_lookup = {
+        int(tag): (
+            float(all_node_coords[3 * idx]),
+            float(all_node_coords[3 * idx + 1]),
+            float(all_node_coords[3 * idx + 2]),
+        )
+        for idx, tag in enumerate(all_node_tags)
+    }
+
+    try:
+        elem_types, elem_tags_list, elem_nodes_list = gmsh.model.mesh.getElements(2)
+    except Exception as err:
+        print(f"[refine_band] Unable to list 2D elements: {err}", file=sys.stderr)
+        return None
+
+    found_any = False
+    worst = float("inf")
+
+    for elem_type, elem_tags, elem_nodes in zip(elem_types, elem_tags_list, elem_nodes_list):
+        _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(elem_type)
+        tags = elem_tags.tolist() if hasattr(elem_tags, "tolist") else list(elem_tags)
+        nodes = elem_nodes.tolist() if hasattr(elem_nodes, "tolist") else list(elem_nodes)
+        for idx in range(len(tags)):
+            start = idx * num_nodes
+            node_ids = [int(n) for n in nodes[start:start + num_nodes]]
+            if num_nodes == 3:
+                tri_batches = [node_ids]
+            elif num_nodes == 4:
+                tri_batches = [node_ids[:3], [node_ids[0], node_ids[2], node_ids[3]]]
+            else:
+                continue
+            for tri in tri_batches:
+                try:
+                    p0 = coord_lookup[tri[0]]
+                    p1 = coord_lookup[tri[1]]
+                    p2 = coord_lookup[tri[2]]
+                except KeyError:
+                    continue
+                q = tri_quality(p0, p1, p2)
+                found_any = True
+                if q < worst:
+                    worst = q
+
+    return worst if found_any else None
+
+
+def _improve_surface_quality(
+    target: float,
+    max_passes: int,
+    methods: Sequence[str],
+) -> Optional[float]:
+    """Iteratively run Gmsh optimizers until the worst triangle meets `target`."""
+    if target <= 0 or max_passes <= 0:
+        return None
+
+    worst = _min_surface_quality()
+    if worst is None or worst >= target:
+        return worst
+
+    failed_methods: set[str] = set()
+
+    for _ in range(int(max_passes)):
+        if worst is not None and worst >= target:
+            break
+        for method in methods:
+            if method in failed_methods:
+                continue
+            try:
+                gmsh.model.mesh.optimize(method=method, niter=1)
+            except Exception as err:
+                # Gracefully skip unsupported optimizers instead of aborting.
+                print(f"[refine_band] Skipping optimizer '{method}': {err}", file=sys.stderr)
+                failed_methods.add(method)
+        worst = _min_surface_quality()
+        if worst is None:
+            break
+
+    return worst
+
+
 def _curves_from_surfaces(surface_tags: Sequence[int]) -> List[int]:
     """Return all boundary curves for the provided surfaces."""
     curves: set[int] = set()
@@ -230,7 +341,10 @@ gmsh.model.mesh.classifySurfaces(
 gmsh.model.mesh.createGeometry()
 gmsh.model.geo.synchronize()
 
-# Build distance field along detected curves.
+# --- Build a boundary-aware size field -----------------------------------
+# 1. Collect the curve entities that bound the target surfaces. We prefer
+#    user-provided Physical Line tags but fall back to the geometric
+#    boundary of the selected surfaces.
 curve_tags = _curves_from_physical_lines(phys_line_targets)
 if not curve_tags:
     volumes = gmsh.model.getEntities(3)
@@ -245,26 +359,51 @@ if not curve_tags:
     gmsh.finalize()
     raise RuntimeError("Unable to detect boundary curves for the refinement band.")
 
+# 2. Evaluate the signed distance to those curves. The field sampling governs
+#    how finely the distance is interpolated along each curve; increase
+#    `distance_sampling` if you need a sharper transition.
 distance_field = gmsh.model.mesh.field.add("Distance")
 gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
-gmsh.model.mesh.field.setNumber(distance_field, "Sampling", 200)
+gmsh.model.mesh.field.setNumber(distance_field, "Sampling", distance_sampling)
+
+# 3. Map distance -> element size with a Threshold field. Distances smaller
+#    than `inner_band` use `lc_min`, distances larger than `outer_band`
+#    use `lc_max`, and the values in between are linearly interpolated.
+inner_band = max(0.0, float(band_width_min))  # 0 => lc_min starts exactly on the boundary
+outer_band = float(band_width_max)
+if outer_band <= inner_band:
+    gmsh.finalize()
+    raise ValueError("band_width_max must be greater than band_width_min to create a transition zone.")
 
 threshold_field = gmsh.model.mesh.field.add("Threshold")
 gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
 gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", lc_min)
 gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", lc_max)
-gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", band_width_min)
-gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", band_width_max)
+gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
+gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
 
+# 4. Install the size field as the new background field so the remesher
+#    honors the boundary band transition. We disable the default
+#    characteristic length heuristics so only our size field is used.
 gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
 gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
 gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
 gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
 gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc_max)
 
-# Generate and smooth the new surface mesh.
+# Generate the new surface mesh.
 gmsh.model.mesh.generate(2)
-gmsh.model.mesh.optimize(method="Laplace2D", niter=5)
+
+# Target poor-quality triangles before any global smoothing to avoid
+# segfaults observed when running optimizers on degenerate elements.
+final_quality = _improve_surface_quality(quality_target, quality_max_passes, quality_methods)
+
+# Optionally run an additional smoothing pass (typically Laplacian).
+if optimize_iterations > 0:
+    gmsh.model.mesh.optimize(method="Laplace2D", niter=int(optimize_iterations))
+
+if final_quality is not None:
+    print(f"Surface min quality after targeted optimization: {final_quality:.3f}")
 
 # Extract the refined mesh.
 all_node_tags, all_node_coords, _ = gmsh.model.mesh.getNodes()
