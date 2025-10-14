@@ -15,6 +15,8 @@ import subprocess, sys
 # plt.style.use('seaborn-v0_8')
 gdal.UseExceptions()
 
+EPS_Z_CLAMP = 10.0
+
 WATER_SURFACE_TAG = 5
 ICE_TAG = 1
 BATHYMETRY_TAG = 2
@@ -39,17 +41,18 @@ phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
-BAND_WIDTH_MAX = 2000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 500.0               # Fine element size inside the refinement band
+BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
+LC_MIN = 100.0               # Fine element size inside the refinement band
 LC_MAX = 500.0               # Default element size far from the refinement band
-DISTANCE_SAMPLING = 20         # Distance field sampling density along curves
+DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
-VOLUME_QUALITY_TARGET = 0.3        # Minimum acceptable mean-ratio quality after optimization
-VOLUME_QUALITY_MAX_PASSES = 1      # Maximum targeted optimization passes
+VOLUME_QUALITY_TARGET = 0.4        # Minimum acceptable mean-ratio quality after optimization
+VOLUME_QUALITY_MAX_PASSES = 3      # Maximum targeted optimization passes
 VOLUME_QUALITY_METHODS: Sequence[str] = (
     "",             # Default tetra optimizer (general smoothing)
     "Relocate3D",   # 3D node relocation smoothing
+    # "Netgen",
 )
 
 # Optional global smoothing / robustness tweaks
@@ -59,19 +62,19 @@ MESH_ALGORITHM3D_QUALITY = 4   # Frontal 3D
 
 # Local refinement configuration
 LOCAL_REFINE_DEFAULT_ENABLED = False
-LOCAL_REFINE_THRESHOLD_DEFAULT = 0.01
-LOCAL_REFINE_MAX_CYCLES_DEFAULT = 1
+LOCAL_REFINE_THRESHOLD_DEFAULT = 0.3
+LOCAL_REFINE_MAX_CYCLES_DEFAULT = 5
 LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT = -1
-LOCAL_REFINE_MAX_BAD_FRACTION = 0.01
-LOCAL_REFINE_MAX_SEED_NODES = 4000
+LOCAL_REFINE_MAX_BAD_FRACTION = 0.0005
+LOCAL_REFINE_MAX_SEED_NODES = 10
 LOCAL_REFINE_INNER_RADIUS_FACTOR = 2.5
-LOCAL_REFINE_OUTER_RADIUS_FACTOR = 100.0
-LOCAL_REFINE_SIZE_MIN_FACTOR = 0.01
-LOCAL_REFINE_DISTANCE_SAMPLING = 500
-LOCAL_REFINE_THRESHOLD_DECAY = 0.1
-LOCAL_REFINE_QUALITY_MARGIN = 0.01
-LOCAL_REFINE_BASE_SIZE_SCALE = 0.6
-LOCAL_REFINE_RESET_BACKGROUND = True
+LOCAL_REFINE_OUTER_RADIUS_FACTOR = 10.0
+LOCAL_REFINE_SIZE_MIN_FACTOR = 10.5
+LOCAL_REFINE_DISTANCE_SAMPLING = 50
+LOCAL_REFINE_THRESHOLD_DECAY = 1.0
+LOCAL_REFINE_QUALITY_MARGIN = 0.5
+LOCAL_REFINE_BASE_SIZE_SCALE = 200.0
+LOCAL_REFINE_RESET_BACKGROUND = False
 
 # 2D boundary distance-field controls
 BOUNDARY_FIELD_SAMPLING = 50
@@ -1210,6 +1213,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                 z = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
                                               highres_trans, highres_array, eps, 
                                               highres = True, interpolate = interpolate)
+
                 model.mesh.setNode(tag, [x, y, scale*z], [])
                 
                 if stack > 0:
@@ -1475,6 +1479,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                 i += 1
             layer += 1
     
+    
     model.geo.synchronize()
 
     if num_of_layers > 2:
@@ -1495,6 +1500,30 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             print("[3D] Could not set Mesh.Algorithm3D; proceeding with default.")
 
     model.mesh.generate(3)
+    
+    nodeTags, coords, _ = gmsh.model.mesh.getNodes()
+    coords = list(coords)
+
+    # def weight(x, y):
+        # d = min(x, L - x, y, L - y)
+        # if clamp <= 0:
+            # return 1.0
+        # t = max(0.0, min(1.0, d / clamp))
+        # return t**p
+
+    # for i in range(len(nodeTags)):
+    #     tag = int(nodeTags[i])
+    #     x = coords[3*i + 0]
+    #     y = coords[3*i + 1]
+    #     z = coords[3*i + 2]
+    #     if abs(z) < EPS_Z_CLAMP:
+    #         z_new = 0.0
+    #     else:
+    #         z_new = z
+    #     # z_new = H * weight(x, y)
+    #     # NOTE: pass empty parametric coords as third arg
+    #     # print('z = ', z)
+    #     gmsh.model.mesh.setNode(tag, [x, y, z_new], [])
 
     final_volume_quality = None
     if optimize:
@@ -1566,34 +1595,41 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     ymin = min(water_node_coords[:,1])
     
     print(meshname)
+    
 
+
+    gmsh.model.mesh.removeDuplicateNodes()
+    gmsh.model.mesh.removeDuplicateElements()
+    gmsh.model.mesh.reclassifyNodes()
+    gmsh.model.geo.synchronize()
+    # model.geo.synchronize()
     # Rotate and shift the mesh so that the inlet aligns with the solver axes
     # and the minimum corner starts at (0, 0, 0).
-    rotated_nodes = []
-    min_rot_x = float("inf")
-    min_rot_y = float("inf")
+    # rotated_nodes = []
+    # min_rot_x = float("inf")
+    # min_rot_y = float("inf")
 
-    for idx, tag in enumerate(water_node_tags):
-        x = water_node_coords[idx][0]
-        y = water_node_coords[idx][1]
-        z = water_node_coords[idx][2]
-        if ((tag not in surface_node_tags) and 
-            (not point_in_set((x, y), xy_shoreline))):
-            z = z/scale
-        x_translated = x - xmin
-        y_translated = y - ymin
-        x_rot, y_rot, z_rot = rotate_coordinates(x_translated, y_translated, z)
-        rotated_nodes.append((tag, x_rot, y_rot, z_rot))
-        if x_rot < min_rot_x:
-            min_rot_x = x_rot
-        if y_rot < min_rot_y:
-            min_rot_y = y_rot
+    # for idx, tag in enumerate(water_node_tags):
+    #     x = water_node_coords[idx][0]
+    #     y = water_node_coords[idx][1]
+    #     z = water_node_coords[idx][2]
+    #     if ((tag not in surface_node_tags) and 
+    #         (not point_in_set((x, y), xy_shoreline))):
+    #         z = z/scale
+    #     x_translated = x - xmin
+    #     y_translated = y - ymin
+    #     x_rot, y_rot, z_rot = rotate_coordinates(x_translated, y_translated, z)
+    #     rotated_nodes.append((tag, x_rot, y_rot, z_rot))
+    #     if x_rot < min_rot_x:
+    #         min_rot_x = x_rot
+    #     if y_rot < min_rot_y:
+    #         min_rot_y = y_rot
 
-    if rotated_nodes:
-        shift_x = -min_rot_x
-        shift_y = -min_rot_y
-        for tag, x_rot, y_rot, z_rot in rotated_nodes:
-            gmsh.model.mesh.setNode(tag, [x_rot + shift_x, y_rot + shift_y, z_rot], [])
+    # if rotated_nodes:
+    #     shift_x = -min_rot_x
+    #     shift_y = -min_rot_y
+    #     for tag, x_rot, y_rot, z_rot in rotated_nodes:
+    #         gmsh.model.mesh.setNode(tag, [x_rot + shift_x, y_rot + shift_y, z_rot], [])
     
     model.geo.synchronize()
     
@@ -1796,7 +1832,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -LC_MIN/1.0, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -1.0*LC_MIN/4.0, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
