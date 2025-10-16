@@ -24,8 +24,8 @@ INFLOW_TAG = 4
 INFLOW_LINE_TAG = 3
 SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
 GMESH_NUM_THREADS = 8
-ROTATE_X_DEGREES = 90
-ROTATE_Y_DEGREES = -116
+ROTATE_X_DEGREES = 270 # rotate so that y is up
+ROTATE_Y_DEGREES = (-246+135-4.15) # rotate so that x_max is at open ocean ("inflow")
 ROTATE_X_RAD = math.radians(ROTATE_X_DEGREES)
 ROTATE_Y_RAD = math.radians(ROTATE_Y_DEGREES)
 ROTATE_X_COS = math.cos(ROTATE_X_RAD)
@@ -42,13 +42,13 @@ phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
 BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 100.0               # Fine element size inside the refinement band
-LC_MAX = 500.0               # Default element size far from the refinement band
+LC_MIN = 500.0               # Fine element size inside the refinement band
+LC_MAX = 2500.0               # Default element size far from the refinement band
 DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
 VOLUME_QUALITY_TARGET = 0.4        # Minimum acceptable mean-ratio quality after optimization
-VOLUME_QUALITY_MAX_PASSES = 3      # Maximum targeted optimization passes
+VOLUME_QUALITY_MAX_PASSES = 10      # Maximum targeted optimization passes
 VOLUME_QUALITY_METHODS: Sequence[str] = (
     "",             # Default tetra optimizer (general smoothing)
     "Relocate3D",   # 3D node relocation smoothing
@@ -1602,34 +1602,33 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     gmsh.model.mesh.removeDuplicateElements()
     gmsh.model.mesh.reclassifyNodes()
     gmsh.model.geo.synchronize()
-    # model.geo.synchronize()
     # Rotate and shift the mesh so that the inlet aligns with the solver axes
     # and the minimum corner starts at (0, 0, 0).
-    # rotated_nodes = []
-    # min_rot_x = float("inf")
-    # min_rot_y = float("inf")
+    rotated_nodes = []
+    min_rot_x = float("inf")
+    min_rot_y = float("inf")
 
-    # for idx, tag in enumerate(water_node_tags):
-    #     x = water_node_coords[idx][0]
-    #     y = water_node_coords[idx][1]
-    #     z = water_node_coords[idx][2]
-    #     if ((tag not in surface_node_tags) and 
-    #         (not point_in_set((x, y), xy_shoreline))):
-    #         z = z/scale
-    #     x_translated = x - xmin
-    #     y_translated = y - ymin
-    #     x_rot, y_rot, z_rot = rotate_coordinates(x_translated, y_translated, z)
-    #     rotated_nodes.append((tag, x_rot, y_rot, z_rot))
-    #     if x_rot < min_rot_x:
-    #         min_rot_x = x_rot
-    #     if y_rot < min_rot_y:
-    #         min_rot_y = y_rot
+    for idx, tag in enumerate(water_node_tags):
+        x = water_node_coords[idx][0]
+        y = water_node_coords[idx][1]
+        z = water_node_coords[idx][2]
+        if ((tag not in surface_node_tags) and 
+            (not point_in_set((x, y), xy_shoreline))):
+            z = z/scale
+        x_translated = x - xmin
+        y_translated = y - ymin
+        x_rot, y_rot, z_rot = rotate_coordinates(x_translated, y_translated, z)
+        rotated_nodes.append((tag, x_rot, y_rot, z_rot))
+        if x_rot < min_rot_x:
+            min_rot_x = x_rot
+        if y_rot < min_rot_y:
+            min_rot_y = y_rot
 
-    # if rotated_nodes:
-    #     shift_x = -min_rot_x
-    #     shift_y = -min_rot_y
-    #     for tag, x_rot, y_rot, z_rot in rotated_nodes:
-    #         gmsh.model.mesh.setNode(tag, [x_rot + shift_x, y_rot + shift_y, z_rot], [])
+    if rotated_nodes:
+        shift_x = -min_rot_x
+        shift_y = -min_rot_y
+        for tag, x_rot, y_rot, z_rot in rotated_nodes:
+            gmsh.model.mesh.setNode(tag, [x_rot + shift_x, y_rot + shift_y, z_rot], [])
     
     model.geo.synchronize()
     
@@ -1813,8 +1812,8 @@ def main():
     
     #Adaptive:
     adaptive = [
-        Scenario(50, 1, 2, False, True, 0), # unstructured
-        # Scenario(560, 1, 2, False, False, 15), # stacked fine
+        # Scenario(50, 1, 2, False, True, 0), # unstructured
+        Scenario(50, 1, 2, False, True, 15), # stacked fine
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
@@ -1832,7 +1831,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -1.0*LC_MIN/4.0, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -1.0*LC_MIN/3.0, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
