@@ -7,7 +7,7 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-from typing import NamedTuple, Sequence, List, Optional
+from typing import NamedTuple, Sequence, List, Optional, Union
 from pathlib import Path
 import subprocess, sys
 
@@ -37,13 +37,23 @@ ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
 phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 
+# --- General utilities ------------------------------------------------------
+
+def ensure_msh_path(name: Union[str, Path]) -> str:
+    """Return a filesystem path with a .msh suffix, ensuring parent directories exist."""
+    path = Path(name)
+    if path.suffix.lower() != ".msh":
+        path = path.with_suffix(".msh")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.as_posix()
+
 # --- Mesh sizing and quality parameters (easy to tweak) ----------------------
 
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
 BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 500.0               # Fine element size inside the refinement band
-LC_MAX = 2500.0               # Default element size far from the refinement band
+LC_MIN = 100.0               # Fine element size inside the refinement band
+LC_MAX = 500.0               # Default element size far from the refinement band
 DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
@@ -770,7 +780,8 @@ def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps,
         return z
 
 def generate_2D_mesh(outline, intersect, grounding_line, category_data, 
-                     m, eps, num_of_layers, adapt, adaptive_scales = (1/4, 2)):
+                     m, eps, num_of_layers, adapt, adaptive_scales = (1/4, 2),
+                     filename: Optional[str] = None):
     """Create the surface mesh that will later be extruded to 3D.
 
     The 2D stage wires up every shoreline, grounding line, and inflow segment
@@ -1095,13 +1106,13 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             y = coord[1]
             xy_grounding.append((x,y))
     
-    filename = f"2D_{num_of_layers}_layer_mesh.msh"
+    mesh_filename = ensure_msh_path(filename or f"2D_{num_of_layers}_layer_mesh.msh")
    
-    gmsh.write(filename)
+    gmsh.write(mesh_filename)
         
     gmsh.finalize()
 
-    mesh2D = (filename, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
+    mesh2D = (mesh_filename, xy_shoreline, xy_grounding, mid_group_1, mid_group_2)
     
     return mesh2D
 
@@ -1109,6 +1120,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                        bathymetry_data, highres_data, thickness_data, surface_pos_data, 
                        scale = 1, num_of_layers = 2, adapt = False, adaptive_scales = (1/4, 2),
                        optimize = False, stack = 25, interpolate = True,
+                       mesh_filename: Optional[str] = None,
                        local_refine: bool = LOCAL_REFINE_DEFAULT_ENABLED,
                        local_refine_threshold: Optional[float] = LOCAL_REFINE_THRESHOLD_DEFAULT,
                        local_refine_max_cycles: int = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
@@ -1119,31 +1131,37 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         eps = eps*(num_of_layers - 1)
 
     mesh2D = generate_2D_mesh(outline, intersect, grounding_line, 
-                              category_data, m, eps, num_of_layers, adapt)
+                              category_data, m, eps, num_of_layers, adapt,
+                              adaptive_scales=adaptive_scales, filename=mesh_filename)
 
-    filename, xy_shoreline, xy_grounding, mid_group_1, mid_group_2 = mesh2D
+    mesh2d_path, xy_shoreline, xy_grounding, mid_group_1, mid_group_2 = mesh2D
     
-    if scale > 1 and num_of_layers == 2:
-        folder = "scaled/"
-        meshname = f"S_{scale}_{m}"
-    elif num_of_layers > 2 and scale > 1:
-        folder = "combo/"
-        meshname = f"C_{num_of_layers}_{scale}_{m}"
-    elif num_of_layers > 2:
-        folder = "layered/"
-        meshname = f"L_{num_of_layers}_{m}"
-    elif stack > 0:
-        folder = "stacked/"
-        meshname = f"P_{stack}_{m}"
+    if mesh_filename:
+        output_path = mesh2d_path
+        meshname = Path(output_path).stem
     else:
-        folder = "unstructured/"
-        meshname = f"M_{m}"
-    
-    if optimize:
-        meshname = f"{meshname}_opt"
-    if adapt:
-        folder = "adaptive/"
-        meshname = f"A_{meshname}"
+        if scale > 1 and num_of_layers == 2:
+            folder = "scaled/"
+            meshname = f"S_{scale}_{m}"
+        elif num_of_layers > 2 and scale > 1:
+            folder = "combo/"
+            meshname = f"C_{num_of_layers}_{scale}_{m}"
+        elif num_of_layers > 2:
+            folder = "layered/"
+            meshname = f"L_{num_of_layers}_{m}"
+        elif stack > 0:
+            folder = "stacked/"
+            meshname = f"P_{stack}_{m}"
+        else:
+            folder = "unstructured/"
+            meshname = f"M_{m}"
+        
+        if optimize:
+            meshname = f"{meshname}_opt"
+        if adapt:
+            folder = "adaptive/"
+            meshname = f"A_{meshname}"
+        output_path = ensure_msh_path(Path(folder) / meshname)
     
     gmsh.initialize()
     gmsh.option.setNumber("General.NumThreads", GMESH_NUM_THREADS)
@@ -1154,7 +1172,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     # Re-open the 2D mesh we just wrote so we can extrude it inside the fresh
     # 3D model.  `merge` imports both geometry and mesh entities.
-    gmsh.merge(filename)
+    gmsh.merge(mesh2d_path)
 
     model.geo.synchronize()
     
@@ -1642,8 +1660,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         # water_node_tags, water_node_coords = gmsh.model.mesh.getNodesForPhysicalGroup(3, 5)
     
     
-    filename = f"{folder}{meshname}.msh"
-    gmsh.write(filename)
+    gmsh.write(output_path)
     gmsh.finalize()
     dof = len(water_node_tags)
     return dof, meshname
@@ -1734,6 +1751,7 @@ def main():
         adapt: bool
         optimize: bool
         stack: float
+        filename: Optional[str] = None
 
     #Unstructured:
     unstructured = [
@@ -1813,7 +1831,7 @@ def main():
     #Adaptive:
     adaptive = [
         # Scenario(50, 1, 2, False, True, 0), # unstructured
-        Scenario(50, 1, 2, False, True, 15), # stacked fine
+        Scenario(50, 1, 2, False, True, 0, "lukas-mesh/stacked_fine.msh"), # stacked fine
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
@@ -1836,6 +1854,7 @@ def main():
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
                                  stack = scenario.stack, interpolate = True,
+                                 mesh_filename = scenario.filename,
                                  local_refine = LOCAL_REFINE_DEFAULT_ENABLED,
                                  local_refine_threshold = LOCAL_REFINE_THRESHOLD_DEFAULT,
                                  local_refine_max_cycles = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
