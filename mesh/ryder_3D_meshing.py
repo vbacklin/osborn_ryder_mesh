@@ -52,8 +52,8 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
 BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 100.0               # Fine element size inside the refinement band
-LC_MAX = 500.0               # Default element size far from the refinement band
+LC_MIN = 50.0               # Fine element size inside the refinement band
+LC_MAX = 250.0               # Default element size far from the refinement band
 DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
@@ -62,7 +62,7 @@ VOLUME_QUALITY_MAX_PASSES = 10      # Maximum targeted optimization passes
 VOLUME_QUALITY_METHODS: Sequence[str] = (
     "",             # Default tetra optimizer (general smoothing)
     "Relocate3D",   # 3D node relocation smoothing
-    # "Netgen",
+    "Netgen",
 )
 
 # Optional global smoothing / robustness tweaks
@@ -1831,7 +1831,7 @@ def main():
     #Adaptive:
     adaptive = [
         # Scenario(50, 1, 2, False, True, 0), # unstructured
-        Scenario(50, 1, 2, False, True, 0, "lukas-mesh/stacked_fine.msh"), # stacked fine
+        Scenario(50, 1, 2, False, True, 15, "lukas-mesh/stacked_fine_50.msh"), # stacked fine
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
@@ -1849,7 +1849,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -1.0*LC_MIN/3.0, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -1.0*LC_MIN/1.5, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
