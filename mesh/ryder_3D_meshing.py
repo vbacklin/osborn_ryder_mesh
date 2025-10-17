@@ -23,7 +23,7 @@ BATHYMETRY_TAG = 2
 INFLOW_TAG = 4
 INFLOW_LINE_TAG = 3
 SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
-GMESH_NUM_THREADS = 8
+GMESH_NUM_THREADS = 1
 ROTATE_X_DEGREES = 270 # rotate so that y is up
 ROTATE_Y_DEGREES = (-246+135-4.15) # rotate so that x_max is at open ocean ("inflow")
 ROTATE_X_RAD = math.radians(ROTATE_X_DEGREES)
@@ -36,6 +36,11 @@ ROTATE_Y_SIN = math.sin(ROTATE_Y_RAD)
 # Physical groups to target (optional).
 phys_line_targets: Sequence[int] = []     # Physical Line tags to follow (1D)
 phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
+
+BandBoundarySpec = Union[str, int]
+# Boundaries within the band that should retain LC_MAX instead of LC_MIN. Entries
+# may be category names such as "inflow" or explicit curve tags.
+BAND_BOUNDARIES_USE_LC_MAX: Sequence[BandBoundarySpec] = ("inflow", INFLOW_LINE_TAG)
 
 # --- General utilities ------------------------------------------------------
 
@@ -52,8 +57,8 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
 BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 50.0               # Fine element size inside the refinement band
-LC_MAX = 250.0               # Default element size far from the refinement band
+LC_MIN = 25.0               # Fine element size inside the refinement band
+LC_MAX = 125.0               # Default element size far from the refinement band
 DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
@@ -63,10 +68,11 @@ VOLUME_QUALITY_METHODS: Sequence[str] = (
     "",             # Default tetra optimizer (general smoothing)
     "Relocate3D",   # 3D node relocation smoothing
     "Netgen",
+    # "Lloyd",
 )
 
 # Optional global smoothing / robustness tweaks
-MESH_SMOOTHING_ITERS = 5
+MESH_SMOOTHING_ITERS = 100
 INITIAL_DELAUNAY_TOL = 1e-13
 MESH_ALGORITHM3D_QUALITY = 4   # Frontal 3D
 
@@ -781,12 +787,15 @@ def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps,
 
 def generate_2D_mesh(outline, intersect, grounding_line, category_data, 
                      m, eps, num_of_layers, adapt, adaptive_scales = (1/4, 2),
-                     filename: Optional[str] = None):
+                     filename: Optional[str] = None,
+                     band_lcmax_boundaries: Optional[Sequence[BandBoundarySpec]] = None):
     """Create the surface mesh that will later be extruded to 3D.
 
     The 2D stage wires up every shoreline, grounding line, and inflow segment
     as explicit curves.  That makes it much easier to preserve important
     physical boundaries once we start extruding with Gmsh.
+    When ``band_lcmax_boundaries`` is supplied (or configured globally) those
+    boundaries keep the coarse ``LC_MAX`` target inside the boundary band.
     """
     
     gmsh.initialize()
@@ -796,6 +805,9 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     
     model = gmsh.model
     model.add("2D")
+    if band_lcmax_boundaries is None:
+        band_lcmax_boundaries = BAND_BOUNDARIES_USE_LC_MAX
+    band_lcmax_boundaries = tuple(band_lcmax_boundaries or ())
     # All geometry entities created below live in this temporary 2D model; we
     # return only the mesh and a few helper lists for the 3D stage.
     
@@ -1012,7 +1024,42 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         
     model.geo.synchronize()
     
-    all_inflow_lines = [tag for dim, tag in all_inflow_lines]
+    all_inflow_lines = [int(tag) for dim, tag in all_inflow_lines]
+    shoreline_curve_tags = [int(tag) for (_, tag) in shorelines]
+    inflow_curve_tags = list(all_inflow_lines)
+    grounding_curve_tags = [int(tag) for (_, tag) in grounding_lines]
+    intersection_curve_tags = [int(tag) for tag in intersection]
+
+    coarse_boundary_lookup = {
+        "inflow": inflow_curve_tags,
+        "inflow_lines": inflow_curve_tags,
+        "shoreline": shoreline_curve_tags,
+        "bathymetry": shoreline_curve_tags,
+        "grounding": grounding_curve_tags,
+        "grounding_line": grounding_curve_tags,
+        "intersection": intersection_curve_tags,
+    }
+
+    coarse_curve_tags: set[int] = set()
+    valid_lookup_keys = tuple(sorted(coarse_boundary_lookup))
+    for spec in band_lcmax_boundaries:
+        if isinstance(spec, str):
+            key = spec.strip().lower()
+            try:
+                coarse_curve_tags.add(int(key))
+                continue
+            except ValueError:
+                pass
+            if key not in coarse_boundary_lookup:
+                options = ", ".join(valid_lookup_keys) or "<none>"
+                raise ValueError(
+                    f"Unknown boundary '{spec}' requested for LC_MAX. "
+                    f"Valid names: {options}, or provide explicit curve tags."
+                )
+            coarse_curve_tags.update(int(tag) for tag in coarse_boundary_lookup[key])
+        else:
+            coarse_curve_tags.add(int(spec))
+
     # --- Build a boundary-aware size field -----------------------------------
     # 1. Collect the curve entities that bound the target surfaces. We prefer
     #    user-provided Physical Line tags but fall back to the geometric
@@ -1031,33 +1078,42 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         gmsh.finalize()
         raise RuntimeError("Unable to detect boundary curves for the refinement band.")
 
+    refine_curve_tags = sorted(tag for tag in curve_tags if tag not in coarse_curve_tags)
+
+    field_api = gmsh.model.mesh.field
     # 2. Evaluate the signed distance to those curves. The field sampling governs
     #    how finely the distance is interpolated along each curve; increase
     #    `DISTANCE_SAMPLING` if you need a sharper transition.
-    distance_field = gmsh.model.mesh.field.add("Distance")
-    gmsh.model.mesh.field.setNumbers(distance_field, "CurvesList", curve_tags)
-    gmsh.model.mesh.field.setNumber(distance_field, "Sampling", DISTANCE_SAMPLING)
-
-    # 3. Map distance -> element size with a Threshold field. Distances smaller
-    #    than `inner_band` use `LC_MIN`, distances larger than `outer_band`
-    #    use `LC_MAX`, and the values in between are linearly interpolated.
     inner_band = max(0.0, float(BAND_WIDTH_MIN))  # 0 => LC_MIN starts exactly on the boundary
     outer_band = float(BAND_WIDTH_MAX)
     if outer_band <= inner_band:
         gmsh.finalize()
         raise ValueError("BAND_WIDTH_MAX must be greater than BAND_WIDTH_MIN to create a transition zone.")
 
-    threshold_field = gmsh.model.mesh.field.add("Threshold")
-    gmsh.model.mesh.field.setNumber(threshold_field, "InField", distance_field)
-    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMin", LC_MIN)
-    gmsh.model.mesh.field.setNumber(threshold_field, "SizeMax", LC_MAX)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMin", inner_band)
-    gmsh.model.mesh.field.setNumber(threshold_field, "DistMax", outer_band)
+    if refine_curve_tags:
+        distance_field = field_api.add("Distance")
+        field_api.setNumbers(distance_field, "CurvesList", refine_curve_tags)
+        field_api.setNumber(distance_field, "Sampling", DISTANCE_SAMPLING)
+
+        # 3. Map distance -> element size with a Threshold field. Distances smaller
+        #    than `inner_band` use `LC_MIN`, distances larger than `outer_band`
+        #    use `LC_MAX`, and the values in between are linearly interpolated.
+        threshold_field = field_api.add("Threshold")
+        field_api.setNumber(threshold_field, "InField", distance_field)
+        field_api.setNumber(threshold_field, "SizeMin", LC_MIN)
+        field_api.setNumber(threshold_field, "SizeMax", LC_MAX)
+        field_api.setNumber(threshold_field, "DistMin", inner_band)
+        field_api.setNumber(threshold_field, "DistMax", outer_band)
+        background_field = threshold_field
+    else:
+        # No curves remain to refine; fall back to a constant LC_MAX field.
+        background_field = field_api.add("Constant")
+        field_api.setNumber(background_field, "Lc", LC_MAX)
 
     # 4. Install the size field as the new background field so the remesher
     #    honors the boundary band transition. We disable the default
     #    characteristic length heuristics so only our size field is used.
-    gmsh.model.mesh.field.setAsBackgroundMesh(threshold_field)
+    field_api.setAsBackgroundMesh(background_field)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
     gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
     gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
@@ -1124,7 +1180,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                        local_refine: bool = LOCAL_REFINE_DEFAULT_ENABLED,
                        local_refine_threshold: Optional[float] = LOCAL_REFINE_THRESHOLD_DEFAULT,
                        local_refine_max_cycles: int = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
-                       local_refine_min_improvement: float = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT):
+                       local_refine_min_improvement: float = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT,
+                       band_lcmax_boundaries: Optional[Sequence[BandBoundarySpec]] = None):
     """Extrude the 2D surface mesh into 3D and sculpt it with raster data."""
     
     if num_of_layers > 2:
@@ -1132,7 +1189,8 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
 
     mesh2D = generate_2D_mesh(outline, intersect, grounding_line, 
                               category_data, m, eps, num_of_layers, adapt,
-                              adaptive_scales=adaptive_scales, filename=mesh_filename)
+                              adaptive_scales=adaptive_scales, filename=mesh_filename,
+                              band_lcmax_boundaries=band_lcmax_boundaries)
 
     mesh2d_path, xy_shoreline, xy_grounding, mid_group_1, mid_group_2 = mesh2D
     
@@ -1831,7 +1889,7 @@ def main():
     #Adaptive:
     adaptive = [
         # Scenario(50, 1, 2, False, True, 0), # unstructured
-        Scenario(50, 1, 2, False, True, 15, "lukas-mesh/stacked_fine_50.msh"), # stacked fine
+        Scenario(50, 1, 2, False, True, 0, "lukas-mesh/unstructured_noinflow_smooth_50.msh"), # stacked fine
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
@@ -1849,7 +1907,7 @@ def main():
     
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -1.0*LC_MIN/1.5, categories, full_bathymetry, highres, 
+                                 scenario.element_size, -1.5*LC_MIN, categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
