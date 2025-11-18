@@ -40,8 +40,16 @@ phys_surface_targets: Sequence[int] = []  # Physical Surface tags to follow (2D)
 BandBoundarySpec = Union[str, int]
 # Boundaries within the band that should retain LC_MAX instead of LC_MIN. Entries
 # may be category names such as "inflow" or explicit curve tags.
-BAND_BOUNDARIES_USE_LC_MAX: Sequence[BandBoundarySpec] = ("inflow", INFLOW_LINE_TAG)
+BAND_BOUNDARIES_USE_LC_MAX: Sequence[BandBoundarySpec] = ("inflow", "intersection", INFLOW_LINE_TAG)
 
+
+        # "inflow": inflow_curve_tags,
+        # "inflow_lines": inflow_curve_tags,
+        # "shoreline": shoreline_curve_tags,
+        # "bathymetry": shoreline_curve_tags,
+        # "grounding": grounding_curve_tags,
+        # "grounding_line": grounding_curve_tags,
+        # "intersection": intersection_curve_tags,
 # --- General utilities ------------------------------------------------------
 
 def ensure_msh_path(name: Union[str, Path]) -> str:
@@ -57,17 +65,17 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
 # Shoreline-aware size band (units match mesh coordinates)
 BAND_WIDTH_MIN = 0.0          # Distance keeping LC_MIN (0 ⇒ LC_MIN starts at the boundary)
 BAND_WIDTH_MAX = 3000.0       # Distance where sizes transition back to LC_MAX; must exceed BAND_WIDTH_MIN
-LC_MIN = 25.0               # Fine element size inside the refinement band
-LC_MAX = 125.0               # Default element size far from the refinement band
+LC_MIN = 500.0               # Fine element size inside the refinement band
+LC_MAX = 2500.0               # Default element size far from the refinement band
 DISTANCE_SAMPLING = 40         # Distance field sampling density along curves
 
 # 3D volumetric quality targets (used when optimize=True)
-VOLUME_QUALITY_TARGET = 0.4        # Minimum acceptable mean-ratio quality after optimization
+VOLUME_QUALITY_TARGET = 0.6        # Minimum acceptable mean-ratio quality after optimization
 VOLUME_QUALITY_MAX_PASSES = 10      # Maximum targeted optimization passes
 VOLUME_QUALITY_METHODS: Sequence[str] = (
     "",             # Default tetra optimizer (general smoothing)
     "Relocate3D",   # 3D node relocation smoothing
-    "Netgen",
+    # "Netgen",
     # "Lloyd",
 )
 
@@ -76,27 +84,19 @@ MESH_SMOOTHING_ITERS = 100
 INITIAL_DELAUNAY_TOL = 1e-13
 MESH_ALGORITHM3D_QUALITY = 4   # Frontal 3D
 
-# Local refinement configuration
-LOCAL_REFINE_DEFAULT_ENABLED = False
-LOCAL_REFINE_THRESHOLD_DEFAULT = 0.3
-LOCAL_REFINE_MAX_CYCLES_DEFAULT = 5
-LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT = -1
-LOCAL_REFINE_MAX_BAD_FRACTION = 0.0005
-LOCAL_REFINE_MAX_SEED_NODES = 10
-LOCAL_REFINE_INNER_RADIUS_FACTOR = 2.5
-LOCAL_REFINE_OUTER_RADIUS_FACTOR = 10.0
-LOCAL_REFINE_SIZE_MIN_FACTOR = 10.5
-LOCAL_REFINE_DISTANCE_SAMPLING = 50
-LOCAL_REFINE_THRESHOLD_DECAY = 1.0
-LOCAL_REFINE_QUALITY_MARGIN = 0.5
-LOCAL_REFINE_BASE_SIZE_SCALE = 200.0
-LOCAL_REFINE_RESET_BACKGROUND = False
+# Mesh optimization controls (standard Gmsh smoothing / optimization)
+ENABLE_VOLUME_OPTIMIZATION_DEFAULT = True  # Default for generate_mesh_mult(..., optimize=...)
+ENABLE_VOLUME_SMOOTHING = True            # Apply Mesh.Smoothing before 3D generation
+ENABLE_VOLUME_QUALITY_ALGORITHM = True    # Prefer quality-focused 3D algorithm
+
+# Uniform mesh refinement controls
+SURFACE_UNIFORM_REFINEMENT_PASSES = 0     # How many uniform refinement passes to run on the 2D mesh
+VOLUME_UNIFORM_REFINEMENT_PASSES = 0      # How many uniform refinement passes to run on the 3D mesh
 
 # 2D boundary distance-field controls
 BOUNDARY_FIELD_SAMPLING = 50
 BOUNDARY_FIELD_DIST_MIN = 0.01
 BOUNDARY_FIELD_DIST_MAX = 10.0
-reset_background = LOCAL_REFINE_RESET_BACKGROUND
 
 
 def _curves_from_physical_lines(ptags: Sequence[int]) -> List[int]:
@@ -229,158 +229,19 @@ def _improve_volume_quality(
     return worst
 
 
-def _local_refine_bad_regions(
-    base_size: float,
-    quality_threshold: float = LOCAL_REFINE_THRESHOLD_DEFAULT,
-    max_bad_fraction: float = LOCAL_REFINE_MAX_BAD_FRACTION,
-    max_seed_nodes: int = LOCAL_REFINE_MAX_SEED_NODES,
-    inner_radius_factor: float = LOCAL_REFINE_INNER_RADIUS_FACTOR,
-    outer_radius_factor: float = LOCAL_REFINE_OUTER_RADIUS_FACTOR,
-    size_min_factor: float = LOCAL_REFINE_SIZE_MIN_FACTOR,
-) -> Optional[int]:
-    """Install a background size field around the worst-quality tets and remesh.
-
-    Returns number of seed nodes used (0 if none), or None on failure.
-    """
-
-    print(f"[local-refine] Start: base_size={base_size}, threshold={quality_threshold}, max_bad_fraction={max_bad_fraction}, max_seed_nodes={max_seed_nodes}")
-
-    try:
-        elem_types, elem_tags_list, elem_nodes_list = gmsh.model.mesh.getElements(3)
-    except Exception as err:
-        print(f"[ryder_3D_meshing] Unable to list 3D elements for local refine: {err}", file=sys.stderr)
-        return None
-
-    per_elem_nodes: dict[int, List[int]] = {}
-    all_elem_tags: List[int] = []
-
-    for etype, tags, nodes in zip(elem_types, elem_tags_list, elem_nodes_list):
+def _run_uniform_refinement(passes: int, label: str) -> None:
+    """Apply Gmsh's uniform refinement ``passes`` times, logging progress."""
+    total = int(max(0, passes))
+    if total <= 0:
+        return
+    for step in range(1, total + 1):
         try:
-            _, _, _, num_nodes, _, _ = gmsh.model.mesh.getElementProperties(etype)
-        except Exception:
-            continue
-        if num_nodes not in (4, 10):
-            continue
-        tag_list = tags.tolist() if hasattr(tags, "tolist") else list(tags)
-        node_list = nodes.tolist() if hasattr(nodes, "tolist") else list(nodes)
-        for i, tag in enumerate(tag_list):
-            start = i * num_nodes
-            elem_nodes = [int(n) for n in node_list[start:start + num_nodes]]
-            per_elem_nodes[int(tag)] = elem_nodes
-        all_elem_tags.extend(int(t) for t in tag_list)
-
-    if not all_elem_tags:
-        print("[local-refine] No 3D elements found; skipping.")
-        return 0
-
-    try:
-        qualities = gmsh.model.mesh.getElementQualities(all_elem_tags, qualityName="gamma")
-    except Exception as err:
-        print(f"[ryder_3D_meshing] Element quality computation failed: {err}", file=sys.stderr)
-        return None
-
-    # Normalize to a plain Python list for robust handling
-    qual_list = qualities.tolist() if hasattr(qualities, "tolist") else list(qualities)
-
-    # Report baseline quality statistics before refinement
-    q_min = float(min(qual_list)) if len(qual_list) > 0 else float("inf")
-    q_avg = float(sum(qual_list) / len(qual_list)) if len(qual_list) > 0 else float("nan")
-    mr_before = _min_volume_quality()
-    print(f"[local-refine] Elements: {len(all_elem_tags)}; min gamma={q_min:.4f}; avg gamma={q_avg:.4f}; min mean-ratio={('n/a' if mr_before is None else f'{mr_before:.4f}')}\n[local-refine] Selecting elements with gamma < {quality_threshold} (cap {int(len(all_elem_tags) * float(max_bad_fraction))})")
-
-    tag_quality = list(zip(all_elem_tags, qual_list))
-    tag_quality.sort(key=lambda tq: float(tq[1]))
-
-    max_bad = max(1, int(len(tag_quality) * float(max_bad_fraction)))
-    selected: List[int] = []
-    for tag, q in tag_quality:
-        if float(q) < float(quality_threshold):
-            selected.append(int(tag))
-            if len(selected) >= max_bad:
-                break
-        else:
+            print(f"[{label}] Uniform refinement pass {step}/{total}")
+            gmsh.model.mesh.refine()
+        except Exception as err:
+            print(f"[{label}] Uniform refinement failed on pass {step}: {err}", file=sys.stderr)
             break
 
-    if not selected:
-        print("[local-refine] Nothing below threshold; skipping.")
-        return 0
-
-    seed_nodes: List[int] = []
-    seen: set[int] = set()
-    for tag in selected:
-        for n in per_elem_nodes.get(tag, []):
-            if n not in seen:
-                seen.add(n)
-                seed_nodes.append(n)
-                if len(seed_nodes) >= int(max_seed_nodes):
-                    break
-        if len(seed_nodes) >= int(max_seed_nodes):
-            break
-
-    if not seed_nodes:
-        print("[local-refine] No seed nodes collected; skipping.")
-        return 0
-
-    r_in = max(1.0, float(inner_radius_factor) * float(base_size))
-    r_out = max(r_in + 1.0, float(outer_radius_factor) * float(base_size))
-    size_min = max(1.0, float(size_min_factor) * float(base_size))
-    size_max = max(size_min, float(base_size))
-
-    print(f"[local-refine] Selected bad elements: {len(selected)}; seed nodes: {len(seed_nodes)}")
-    print(f"[local-refine] Band radii: r_in={r_in:.2f}, r_out={r_out:.2f}; target sizes: min={size_min:.2f}, max={size_max:.2f}")
-
-    try:
-        fdist = gmsh.model.mesh.field.add("Distance")
-        gmsh.model.mesh.field.setNumbers(fdist, "NodesList", seed_nodes)
-        gmsh.model.mesh.field.setNumber(fdist, "Sampling", LOCAL_REFINE_DISTANCE_SAMPLING)
-
-        fthr = gmsh.model.mesh.field.add("Threshold")
-        gmsh.model.mesh.field.setNumber(fthr, "InField", fdist)
-        gmsh.model.mesh.field.setNumber(fthr, "SizeMin", size_min)
-        gmsh.model.mesh.field.setNumber(fthr, "SizeMax", size_max)
-        gmsh.model.mesh.field.setNumber(fthr, "DistMin", r_in)
-        gmsh.model.mesh.field.setNumber(fthr, "DistMax", r_out)
-
-        gmsh.model.mesh.field.setAsBackgroundMesh(fthr)
-        print("[local-refine] Background size field installed.")
-        
-        # 4. Install the size field as the new background field so the remesher
-        #    honors the boundary band transition. We disable the default
-        #    characteristic length heuristics so only our size field is used.
-        # gmsh.model.mesh.field.setAsBackgroundMesh(fthr)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
-        # gmsh.option.setNumber("Mesh.CharacteristicLengthMax", LC_MAX)
-    except Exception as err:
-        print(f"[ryder_3D_meshing] Local refine field setup failed: {err}", file=sys.stderr)
-        return None
-
-    try:
-        print("[local-refine] Remeshing 3D ...")
-        gmsh.model.mesh.generate(3)
-        gmsh.model.mesh.removeDuplicateNodes()
-        gmsh.model.mesh.removeDuplicateElements()
-        gmsh.model.mesh.reclassifyNodes()
-        gmsh.model.geo.synchronize()
-        # Report post-remesh quality
-        mr_after = _min_volume_quality()
-        print(f"[local-refine] Done. min mean-ratio before={('n/a' if mr_before is None else f'{mr_before:.4f}')}, after={('n/a' if mr_after is None else f'{mr_after:.4f}')}.")
-    except Exception as err:
-        print(f"[ryder_3D_meshing] Remeshing after local refine failed: {err}", file=sys.stderr)
-        return None
-    finally:
-        if reset_background:
-            try:
-                gmsh.model.mesh.field.remove(fthr)
-            except Exception:
-                pass
-            try:
-                gmsh.model.mesh.field.remove(fdist)
-            except Exception:
-                pass
-
-    return len(seed_nodes)
 
 def readraster(filename):
     """Load a raster with GDAL and write a working copy next to our scripts.
@@ -1134,6 +995,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
   
     model.geo.synchronize()
     model.mesh.generate(2)
+    if SURFACE_UNIFORM_REFINEMENT_PASSES > 0:
+        _run_uniform_refinement(SURFACE_UNIFORM_REFINEMENT_PASSES, "2D")
     # gmsh.model.mesh.optimize(method="Laplace2D", niter=5)
     
     # Store the XY footprint of important curves so the 3D stage can spot when
@@ -1175,12 +1038,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
 def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data, 
                        bathymetry_data, highres_data, thickness_data, surface_pos_data, 
                        scale = 1, num_of_layers = 2, adapt = False, adaptive_scales = (1/4, 2),
-                       optimize = False, stack = 25, interpolate = True,
+                       optimize: bool = ENABLE_VOLUME_OPTIMIZATION_DEFAULT, stack = 25, interpolate = True,
                        mesh_filename: Optional[str] = None,
-                       local_refine: bool = LOCAL_REFINE_DEFAULT_ENABLED,
-                       local_refine_threshold: Optional[float] = LOCAL_REFINE_THRESHOLD_DEFAULT,
-                       local_refine_max_cycles: int = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
-                       local_refine_min_improvement: float = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT,
                        band_lcmax_boundaries: Optional[Sequence[BandBoundarySpec]] = None):
     """Extrude the 2D surface mesh into 3D and sculpt it with raster data."""
     
@@ -1565,10 +1424,12 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", INITIAL_DELAUNAY_TOL)
 
     if optimize:
-        # Light Laplacian smoothing when quality tuning is requested.
-        gmsh.option.setNumber("Mesh.Smoothing", MESH_SMOOTHING_ITERS)
-    # Prefer quality-oriented 3D algorithm when tuning quality or local refine.
-    if optimize or local_refine:
+        if ENABLE_VOLUME_SMOOTHING:
+            # Light Laplacian smoothing when quality tuning is requested.
+            gmsh.option.setNumber("Mesh.Smoothing", MESH_SMOOTHING_ITERS)
+        else:
+            gmsh.option.setNumber("Mesh.Smoothing", 0)
+    if optimize and ENABLE_VOLUME_QUALITY_ALGORITHM:
         try:
             gmsh.option.setNumber("Mesh.Algorithm3D", MESH_ALGORITHM3D_QUALITY)
             print(f"[3D] Using Mesh.Algorithm3D = {MESH_ALGORITHM3D_QUALITY} (quality-oriented)")
@@ -1576,6 +1437,17 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             print("[3D] Could not set Mesh.Algorithm3D; proceeding with default.")
 
     model.mesh.generate(3)
+    # fix quality before and after?
+    # final_volume_quality = None
+    # if optimize:
+    #     final_volume_quality = _improve_volume_quality(
+    #         VOLUME_QUALITY_TARGET,
+    #         VOLUME_QUALITY_MAX_PASSES,
+    #         VOLUME_QUALITY_METHODS,
+    #     )
+    
+    if VOLUME_UNIFORM_REFINEMENT_PASSES > 0:
+        _run_uniform_refinement(VOLUME_UNIFORM_REFINEMENT_PASSES, "3D")
     
     nodeTags, coords, _ = gmsh.model.mesh.getNodes()
     coords = list(coords)
@@ -1608,48 +1480,6 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             VOLUME_QUALITY_MAX_PASSES,
             VOLUME_QUALITY_METHODS,
         )
-
-    # Optional: locally refine around worst-quality tets, then re-optimize (multi-cycle).
-    if (optimize and local_refine):
-        refine_threshold = float(local_refine_threshold) if local_refine_threshold is not None else float(VOLUME_QUALITY_TARGET)
-        cycles = max(1, int(local_refine_max_cycles))
-        current_q = final_volume_quality if final_volume_quality is not None else _min_volume_quality()
-        print(f"[local-refine] Requested with threshold={refine_threshold}. Current min mean-ratio={('n/a' if current_q is None else f'{current_q:.4f}')}. Max cycles={cycles}.")
-        last_q = current_q if current_q is not None else 0.0
-        for c in range(1, cycles + 1):
-            if current_q is not None and current_q >= refine_threshold:
-                print(f"[local-refine] Target reached (min={current_q:.4f} >= {refine_threshold}). Stopping at cycle {c-1}.")
-                break
-            cycle_threshold = max((current_q or 0.0) + LOCAL_REFINE_QUALITY_MARGIN, refine_threshold)
-            cycle_base_size = max(1.0, float(m) * (LOCAL_REFINE_BASE_SIZE_SCALE ** (c - 1)))
-            print(f"[local-refine] Cycle {c}/{cycles}: refining regions below {cycle_threshold:.4f} (base_size={cycle_base_size:.2f}) ...")
-            seeds = _local_refine_bad_regions(
-                base_size=cycle_base_size,
-                quality_threshold=float(cycle_threshold),
-            )
-            if not seeds:
-                print("[local-refine] No seeds applied in this cycle; stopping further refinement.")
-                break
-            print(f"[local-refine] Seeds used in cycle {c}: {seeds}. Re-running optimizer ...")
-            final_volume_quality = _improve_volume_quality(
-                VOLUME_QUALITY_TARGET,
-                VOLUME_QUALITY_MAX_PASSES,
-                VOLUME_QUALITY_METHODS,
-            )
-            current_q = final_volume_quality if final_volume_quality is not None else _min_volume_quality()
-            if current_q is None:
-                print("[local-refine] Could not evaluate quality after optimization; stopping.")
-                break
-            improvement = current_q - (last_q if last_q is not None else 0.0)
-            print(f"[local-refine] After cycle {c}: min mean-ratio={current_q:.4f} (prev={('n/a' if last_q is None else f'{last_q:.4f}')}); Δ={improvement:.4e}.")
-            # if improvement <= 0:
-            #     print("[local-refine] No improvement observed; stopping further refinement.")
-            #     break
-            if local_refine_min_improvement > 0 and improvement < float(local_refine_min_improvement):
-                print(f"[local-refine] Improvement {improvement:.4e} < {local_refine_min_improvement}; stopping early.")
-                break
-            last_q = current_q
-            refine_threshold = max(current_q + LOCAL_REFINE_QUALITY_MARGIN, refine_threshold * LOCAL_REFINE_THRESHOLD_DECAY)
 
     model.mesh.removeDuplicateNodes()
     model.mesh.removeDuplicateElements()
@@ -1813,66 +1643,66 @@ def main():
 
     #Unstructured:
     unstructured = [
-        Scenario(400, 1, 2, False, False, 0),
-        Scenario(300, 1, 2, False, False, 0),
-        Scenario(250, 1, 2, False, False, 0),
-        Scenario(200, 1, 2, False, False, 0),
-        Scenario(160, 1, 2, False, False, 0),
+        # Scenario(400, 1, 2, False, False, 0),
+        # Scenario(300, 1, 2, False, False, 0),
+        # Scenario(250, 1, 2, False, False, 0),
+        # Scenario(200, 1, 2, False, False, 0),
+        # Scenario(160, 1, 2, False, False, 0),
     ]
     #Scaled DOF-test 200m:
     
     scaled_200_dofs = [
-        Scenario(200, 2, 2, False, False, 0),
-        Scenario(200, 3, 2, False, False, 0),
-        Scenario(200, 4, 2, False, False, 0),
-        Scenario(200, 5, 2, False, False, 0),
-        Scenario(200, 6, 2, False, False, 0),
-        Scenario(200, 7, 2, False, False, 0),
-        Scenario(200, 8, 2, False, False, 0),
-        Scenario(200, 9, 2, False, False, 0),
-        Scenario(200, 10, 2, False, False, 0),
-        Scenario(200, 11, 2, False, False, 0),
-        Scenario(200, 12, 2, False, False, 0),
-        Scenario(200, 13, 2, False, False, 0),
-        Scenario(200, 14, 2, False, False, 0),
-        Scenario(200, 15, 2, False, False, 0),
+        # Scenario(200, 2, 2, False, False, 0),
+        # Scenario(200, 3, 2, False, False, 0),
+        # Scenario(200, 4, 2, False, False, 0),
+        # Scenario(200, 5, 2, False, False, 0),
+        # Scenario(200, 6, 2, False, False, 0),
+        # Scenario(200, 7, 2, False, False, 0),
+        # Scenario(200, 8, 2, False, False, 0),
+        # Scenario(200, 9, 2, False, False, 0),
+        # Scenario(200, 10, 2, False, False, 0),
+        # Scenario(200, 11, 2, False, False, 0),
+        # Scenario(200, 12, 2, False, False, 0),
+        # Scenario(200, 13, 2, False, False, 0),
+        # Scenario(200, 14, 2, False, False, 0),
+        # Scenario(200, 15, 2, False, False, 0),
     ]
 
     #Scaled DOF-test 220m:
     
     scaled_220_dofs = [
-        Scenario(220, 2, 2, False, False, 0),
-        Scenario(220, 3, 2, False, False, 0),
-        Scenario(220, 4, 2, False, False, 0),
-        Scenario(220, 5, 2, False, False, 0),
-        Scenario(220, 6, 2, False, False, 0),
-        Scenario(220, 7, 2, False, False, 0),
-        Scenario(220, 8, 2, False, False, 0),
-        Scenario(220, 9, 2, False, False, 0),
-        Scenario(220, 10, 2, False, False, 0),
-        Scenario(220, 11, 2, False, False, 0),
-        Scenario(220, 12, 2, False, False, 0),
-        Scenario(220, 13, 2, False, False, 0),
-        Scenario(220, 14, 2, False, False, 0),
-        Scenario(220, 15, 2, False, False, 0),
+        # Scenario(220, 2, 2, False, False, 0),
+        # Scenario(220, 3, 2, False, False, 0),
+        # Scenario(220, 4, 2, False, False, 0),
+        # Scenario(220, 5, 2, False, False, 0),
+        # Scenario(220, 6, 2, False, False, 0),
+        # Scenario(220, 7, 2, False, False, 0),
+        # Scenario(220, 8, 2, False, False, 0),
+        # Scenario(220, 9, 2, False, False, 0),
+        # Scenario(220, 10, 2, False, False, 0),
+        # Scenario(220, 11, 2, False, False, 0),
+        # Scenario(220, 12, 2, False, False, 0),
+        # Scenario(220, 13, 2, False, False, 0),
+        # Scenario(220, 14, 2, False, False, 0),
+        # Scenario(220, 15, 2, False, False, 0),
     ]
     
     #Scaled:
     
     scaled = [
-        Scenario(220, 6, 2, False, False, 0),
-        Scenario(220, 6, 2, False, True, 0),
-        Scenario(200, 11, 2, False, False, 0),
-        Scenario(200, 6, 2, False, True, 0),
+        # Scenario(220, 6, 2, False, False, 0),
+        # Scenario(220, 6, 2, False, True, 0),
+        # Scenario(200, 11, 2, False, False, 0),
+        # Scenario(200, 6, 2, False, True, 0),
     ]
     
     #Layered:
     
     layered = [
-        Scenario(295, 1, 9, False, False, 0),
-        Scenario(340, 1, 12, False, False, 0),
-        Scenario(410, 1, 16, False, False, 0),
-        Scenario(450, 1, 20, False, False, 0),
+        # Scenario(295, 1, 9, False, False, 0),
+        # Scenario(340, 1, 12, False, False, 0),
+        # Scenario(410, 1, 16, False, False, 0),
+        # Scenario(450, 1, 20, False, False, 0),
     ]
     
     #Stacked:
@@ -1889,7 +1719,11 @@ def main():
     #Adaptive:
     adaptive = [
         # Scenario(50, 1, 2, False, True, 0), # unstructured
-        Scenario(50, 1, 2, False, True, 0, "lukas-mesh/unstructured_noinflow_smooth_50.msh"), # stacked fine
+        
+        
+        # Lukas: element size does not do anything at the moment. Mesh size is controlled by LC_MIN, LC_MAX at the top of the script.
+        Scenario(500, 6, 2, False, False, 0, "coarse_test.msh"), # stacked fine
+        
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
         # Scenario(400, 1, 2, True, False, 20),
@@ -1898,25 +1732,23 @@ def main():
     ]
     
     #Combo test:
-    combo_test = [
-        Scenario(295, 11, 5, False, False, 0),
-        Scenario(410, 39, 13, False, False, 0),
-    ]
+    # combo_test = [
+    #     Scenario(295, 11, 5, False, False, 0),
+    #     Scenario(410, 39, 13, False, False, 0),
+    # ]
     
-    params = adaptive#stacked#combo_test
+    params = adaptive
     
+    #eps_extrude = -LC_MIN/4.0
+    eps_extrude = - 1.0
     for scenario in params:
         dof, meshname = generate_mesh_mult(outline, intersect, grounding_line, 
-                                 scenario.element_size, -1.5*LC_MIN, categories, full_bathymetry, highres, 
+                                 scenario.element_size, eps_extrude , categories, full_bathymetry, highres, 
                                  thickness_data, surface_pos_data, scale = scenario.scale, 
                                  num_of_layers = scenario.num_layers, adapt = scenario.adapt, 
                                  adaptive_scales = (1/4, 2), optimize = scenario.optimize, 
                                  stack = scenario.stack, interpolate = True,
-                                 mesh_filename = scenario.filename,
-                                 local_refine = LOCAL_REFINE_DEFAULT_ENABLED,
-                                 local_refine_threshold = LOCAL_REFINE_THRESHOLD_DEFAULT,
-                                 local_refine_max_cycles = LOCAL_REFINE_MAX_CYCLES_DEFAULT,
-                                 local_refine_min_improvement = LOCAL_REFINE_MIN_IMPROVEMENT_DEFAULT)
+                                 mesh_filename = scenario.filename)
         dofs.append((meshname, dof))
     
     for meshname, dof in dofs:
