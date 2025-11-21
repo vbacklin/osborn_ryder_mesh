@@ -7,7 +7,8 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-from typing import NamedTuple, Sequence, List, Optional, Union
+import meshio
+from typing import Dict, NamedTuple, Sequence, List, Optional, Union
 from pathlib import Path
 import subprocess, sys
 
@@ -59,6 +60,44 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
         path = path.with_suffix(".msh")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.as_posix()
+
+
+def write_legacy_xdmf(msh_path: Union[str, Path]) -> Path:
+    """Write an XDMF companion file with physical tags preserved for FEniCS."""
+
+    msh_path = Path(msh_path)
+    xdmf_path = msh_path.with_suffix(".xdmf")
+    msh = meshio.read(msh_path)
+
+    cells: List[tuple[str, np.ndarray]] = []
+    cell_data: Dict[str, List[np.ndarray]] = {name: [] for name in msh.cell_data.keys()}
+
+    for idx, cell_block in enumerate(msh.cells):
+        if cell_block.type not in ("triangle", "tetra"):
+            continue
+        cells.append((cell_block.type, cell_block.data))
+        for name, data_list in msh.cell_data.items():
+            arr = data_list[idx]
+            cell_data[name].append(np.asarray(arr, dtype=np.int32))
+
+    if not cells:
+        raise ValueError(f"{msh_path} contains no tetra or triangle cells to export.")
+
+    if "name_to_read" not in cell_data and "gmsh:physical" in cell_data:
+        cell_data["name_to_read"] = [np.array(arr, dtype=np.int32) for arr in cell_data["gmsh:physical"]]
+
+    meshio.write(
+        xdmf_path,
+        meshio.Mesh(
+            points=msh.points,
+            cells=cells,
+            cell_data=cell_data,
+            field_data=msh.field_data,
+        ),
+        file_format="xdmf",
+    )
+
+    return xdmf_path
 
 # --- Mesh sizing and quality parameters (easy to tweak) ----------------------
 
@@ -446,9 +485,9 @@ def plot_full_outline(lines):
     # ax.set_xlabel('$x$ (m)', fontsize = 12)
     # ax.set_ylabel('$y$ (m)', fontsize = 12)
     # plt.title("Outline Boundary Points",
-            #   fontsize = 14)
+    #           fontsize = 14)
     # plt.legend(loc="best", frameon = True, facecolor = "white", edgecolor = "black", 
-            #    fontsize=8)
+    #            fontsize=8)
     # plt.draw()
         
 
@@ -1550,6 +1589,11 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     gmsh.write(output_path)
     gmsh.finalize()
+    try:
+        xdmf_path = write_legacy_xdmf(output_path)
+        print(f"Wrote XDMF companion for FEniCS: {xdmf_path}")
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Failed to write XDMF next to {output_path}: {err}", file=sys.stderr)
     dof = len(water_node_tags)
     return dof, meshname
 
