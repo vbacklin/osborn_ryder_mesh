@@ -1,4 +1,4 @@
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import math
 import numpy as np
 from osgeo import gdal
@@ -7,7 +7,8 @@ from osgeo import osr
 from osgeo_utils import gdal_calc
 import shutil
 import gmsh
-from typing import NamedTuple, Sequence, List, Optional, Union
+import meshio
+from typing import Dict, NamedTuple, Sequence, List, Optional, Union
 from pathlib import Path
 import subprocess, sys
 
@@ -50,7 +51,64 @@ BAND_BOUNDARIES_USE_LC_MAX: Sequence[BandBoundarySpec] = ("inflow", "intersectio
         # "grounding": grounding_curve_tags,
         # "grounding_line": grounding_curve_tags,
         # "intersection": intersection_curve_tags,
+
+#-----josis functions------------------------------------------------------------------------
+
+def save_array_as_tiff(array, template_ds, out_path, dtype=gdal.GDT_Float32, nodata=None, compress=True):
+    """
+    Save a numpy array as a GeoTIFF, copying geotransform and projection
+    from a template GDAL dataset.
+
+    Parameters
+    ----------
+    array : np.ndarray
+        2D numpy array to save.
+    template_ds : gdal.Dataset
+        GDAL dataset providing georeferencing info (same size as array).
+    out_path : str
+        Output .tif file path.
+    dtype : gdal datatype, optional
+        Output raster type, e.g. gdal.GDT_Float32.
+    nodata : float or int, optional
+        Nodata value to set in the output band.
+    compress : bool, optional
+        If True, use LZW compression.
+    """
+
+    # Get spatial metadata from template
+    gt = template_ds.GetGeoTransform()
+    proj = template_ds.GetProjection()
+
+    # Raster shape
+    ny, nx = array.shape
+
+    # Choose driver + compression options
+    driver = gdal.GetDriverByName("GTIFF")
+    options = ["COMPRESS=LZW"] if compress else []
+
+    # Create output raster
+    out_ds = driver.Create(out_path, nx, ny, 1, dtype, options=options)
+
+    out_ds.SetGeoTransform(gt)
+    out_ds.SetProjection(proj)
+
+    # Write array
+    band = out_ds.GetRasterBand(1)
+
+    # Nodata if provided
+    if nodata is not None:
+        band.SetNoDataValue(nodata)
+
+    band.WriteArray(array)
+    band.FlushCache()
+
+    # Close
+    out_ds = None
+    print(f"Saved GeoTIFF → {out_path}")
+
 # --- General utilities ------------------------------------------------------
+
+
 
 def ensure_msh_path(name: Union[str, Path]) -> str:
     """Return a filesystem path with a .msh suffix, ensuring parent directories exist."""
@@ -59,6 +117,44 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
         path = path.with_suffix(".msh")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path.as_posix()
+
+
+def write_legacy_xdmf(msh_path: Union[str, Path]) -> Path:
+    """Write an XDMF companion file with physical tags preserved for FEniCS."""
+
+    msh_path = Path(msh_path)
+    xdmf_path = msh_path.with_suffix(".xdmf")
+    msh = meshio.read(msh_path)
+
+    cells: List[tuple[str, np.ndarray]] = []
+    cell_data: Dict[str, List[np.ndarray]] = {name: [] for name in msh.cell_data.keys()}
+
+    for idx, cell_block in enumerate(msh.cells):
+        if cell_block.type not in ("triangle", "tetra"):
+            continue
+        cells.append((cell_block.type, cell_block.data))
+        for name, data_list in msh.cell_data.items():
+            arr = data_list[idx]
+            cell_data[name].append(np.asarray(arr, dtype=np.int32))
+
+    if not cells:
+        raise ValueError(f"{msh_path} contains no tetra or triangle cells to export.")
+
+    if "name_to_read" not in cell_data and "gmsh:physical" in cell_data:
+        cell_data["name_to_read"] = [np.array(arr, dtype=np.int32) for arr in cell_data["gmsh:physical"]]
+
+    meshio.write(
+        xdmf_path,
+        meshio.Mesh(
+            points=msh.points,
+            cells=cells,
+            cell_data=cell_data,
+            field_data=msh.field_data,
+        ),
+        file_format="xdmf",
+    )
+
+    return xdmf_path
 
 # --- Mesh sizing and quality parameters (easy to tweak) ----------------------
 
@@ -166,7 +262,7 @@ def _min_volume_quality() -> Optional[float]:
         print(f"[ryder_3D_meshing] Unable to list 3D elements: {err}", file=sys.stderr)
         return None
 
-    found_any = False
+    found_any = False; 
     worst = float("inf")
 
     for elem_type, elem_tags, elem_nodes in zip(elem_types, elem_tags_list, elem_nodes_list):
@@ -420,18 +516,18 @@ def plot_main_geoline(shoreline):
         X.append(coord[0])
         Y.append(coord[1])
     
-    # plt.figure(figsize=(5, 5))
-    # plt.scatter(X, Y)
-    # ax = plt.gca()
-    # ax.set_aspect('equal', adjustable='box')
-    # ax.set_xlabel('Meters')
-    # ax.set_ylabel('Meters')
-    # plt.draw()
+    plt.figure(figsize=(5, 5))
+    plt.scatter(X, Y)
+    ax = plt.gca()
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('Meters')
+    ax.set_ylabel('Meters')
+    plt.draw()
     
 def plot_full_outline(lines):
     """Debug helper to visualise multiple boundary polylines."""
     
-    # plt.figure(figsize=(6,8))
+    plt.figure(figsize=(6,8))
     
     for line in lines.keys():
         X = []
@@ -439,9 +535,9 @@ def plot_full_outline(lines):
         for coord in lines[line]:
             X.append(coord[0])
             Y.append(coord[1])
-        # plt.plot(X, Y, marker = 'o', markersize = 5, linestyle = '--', label=line)
+        plt.plot(X, Y, marker = 'o', markersize = 5, linestyle = '--', label=line)
         
-    # ax = plt.gca()
+    ax = plt.gca()
     # ax.set_aspect('equal', adjustable='box')
     # ax.set_xlabel('$x$ (m)', fontsize = 12)
     # ax.set_ylabel('$y$ (m)', fontsize = 12)
@@ -449,7 +545,7 @@ def plot_full_outline(lines):
             #   fontsize = 14)
     # plt.legend(loc="best", frameon = True, facecolor = "white", edgecolor = "black", 
             #    fontsize=8)
-    # plt.draw()
+    plt.draw()
         
 
 def check_if_inflow(point, category_array, category_trans):
@@ -646,6 +742,8 @@ def get_ice_depth(x, y, thic_trans, thic_array, surf_array, bath_array, eps,
             print(f'Warning: {z} returned for depth {bath_level}')
         return z
 
+
+
 def generate_2D_mesh(outline, intersect, grounding_line, category_data, 
                      m, eps, num_of_layers, adapt, adaptive_scales = (1/4, 2),
                      filename: Optional[str] = None,
@@ -679,6 +777,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         sizes = (adaptive_scales[0]*m, m, adaptive_scales[1]*m)
     else:
         sizes = (m,m,m)
+
+    return
     
     category_array = category_data.ReadAsArray()
     category_trans = category_data.GetGeoTransform()
@@ -787,6 +887,9 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     boundary_curve_tags.update(intersection)
 
     model.geo.synchronize()
+
+
+
 
     if boundary_curve_tags:
         field_api = gmsh.model.mesh.field
@@ -1012,6 +1115,8 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             x = coord[0]
             y = coord[1]
             xy_shoreline.append((x,y))
+
+    plot_xy_shoreline(xy_shoreline)
     
     xy_grounding = []            
     grounding_line_tags = [tag for (dim, tag) in grounding_lines]
@@ -1035,6 +1140,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     
     return mesh2D
 
+
 def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data, 
                        bathymetry_data, highres_data, thickness_data, surface_pos_data, 
                        scale = 1, num_of_layers = 2, adapt = False, adaptive_scales = (1/4, 2),
@@ -1052,6 +1158,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                               band_lcmax_boundaries=band_lcmax_boundaries)
 
     mesh2d_path, xy_shoreline, xy_grounding, mid_group_1, mid_group_2 = mesh2D
+
     
     if mesh_filename:
         output_path = mesh2d_path
@@ -1109,6 +1216,12 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     bathymetry_node_coords = bathymetry_node_coords.reshape((bathymetry_node_tags.size, 3))
     surface_node_coords = surface_node_coords.reshape((surface_node_tags.size, 3))
     ice_node_coords = ice_node_coords.reshape((ice_node_tags.size, 3))
+
+    print('bathymetry_node_coords')
+    print(bathymetry_node_coords)
+
+    print('surface_node_coords')
+    print(surface_node_coords)
     
     if stack > 0:
         # Stacked meshes include additional horizontal slices (synthetic layers
@@ -1135,14 +1248,33 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         scale = scale
     else:
         scale = scale
-    
+
+
+#    points = [tag for dim, tag in model.getEntities(0)]
+#    point_coords = [model.getValue(0, tag, []) for tag in points]
+#    print('points')
+#    print(points)   
+#    print('point_coords')
+#    print(point_coords) 
+
+ #   print('bathymetrh_node_tags')
+ #   print(bathymetry_node_tags)
+
+  #  print('ice_node_tags')
+  #  print(ice_node_tags)
+
+  #  print('surface_node_tags')
+  #  print(surface_node_tags)
+
+
     i = 0
     for tag in bathymetry_node_tags:
         if tag not in surface_node_tags:
             x = bathymetry_node_coords[i][0]
             y = bathymetry_node_coords[i][1]
-               
-            if not point_in_set((x,y), xy_shoreline):#(x, y) not in xy_shoreline:
+            
+            if True:   
+            #if not point_in_set((x,y), xy_shoreline):#(x, y) not in xy_shoreline:
                 # Drive each bathymetry vertex to the raster-derived depth and
                 # optionally create extra points for stacked layers.
                 z = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
@@ -1150,6 +1282,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                                               highres = True, interpolate = interpolate)
 
                 model.mesh.setNode(tag, [x, y, scale*z], [])
+                   
                 
                 if stack > 0:
                     if (((not point_in_set(((x,y)), xy_ice)) and (tag not in inflow_node_tags)) 
@@ -1159,6 +1292,13 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                             current_depth = current_depth - stack
                             point = model.geo.addPoint(x, y, current_depth, sizes[2])
                             stacked_points.append(point)
+            else:
+                #z = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
+                        #                      highres_trans, highres_array, eps, 
+                        #                      highres = True, interpolate = interpolate)
+                #model.mesh.setNode(tag, [x, y, 10], [])
+                pass
+
                         
         i += 1
     
@@ -1182,6 +1322,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                 z = get_ice_depth(x, y, thickness_trans, thickness_array, 
                                       surface_pos_array, bathymetry_array, 
                                       eps, interpolate = interpolate)
+               # z = depth - eps
                 gmsh.model.mesh.setNode(tag, [x, y, scale*z], [])
                 
                 if stack > 0:
@@ -1375,11 +1516,12 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
             for tag in mid_node_tags:
                 x = mid_node_coords[i][0]
                 y = mid_node_coords[i][1]
-                if not point_in_set((x,y), xy_shoreline):#(x, y) not in xy_shoreline:
+                if True: #not point_in_set((x,y), xy_shoreline):#(x, y) not in xy_shoreline:
                     depth = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
                                                   highres_trans, highres_array, eps, 
                                                   highres = True, interpolate = interpolate)
                     z = depth*(layer/(num_of_layers-1))
+
                     model.mesh.setNode(tag, [x, y, scale*z], [])
                 i += 1
             layer += 1
@@ -1401,7 +1543,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
                                                   highres = True, interpolate = interpolate)
                     z = depth - eps*((num_of_layers - 1 - layer)/(num_of_layers-1))
                     gmsh.model.mesh.setNode(tag, [x, y, scale*z], [])
-                elif (not point_in_set((x,y), xy_shoreline)) and (tag not in skip_tags):
+                elif (tag not in skip_tags): #(not point_in_set((x,y), xy_shoreline)) and
                     bath = get_bathymetric_depth(x, y, bathymetry_trans, bathymetry_array, 
                                                  highres_trans, highres_array, eps, 
                                                  highres = True, interpolate = interpolate)
@@ -1518,8 +1660,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
         x = water_node_coords[idx][0]
         y = water_node_coords[idx][1]
         z = water_node_coords[idx][2]
-        if ((tag not in surface_node_tags) and 
-            (not point_in_set((x, y), xy_shoreline))):
+        if ((tag not in surface_node_tags)):# and (not point_in_set((x, y), xy_shoreline))):
             z = z/scale
         x_translated = x - xmin
         y_translated = y - ymin
@@ -1550,33 +1691,208 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     
     gmsh.write(output_path)
     gmsh.finalize()
+    try:
+        xdmf_path = write_legacy_xdmf(output_path)
+        print(f"Wrote XDMF companion for FEniCS: {xdmf_path}")
+    except Exception as err:
+        print(f"[ryder_3D_meshing] Failed to write XDMF next to {output_path}: {err}", file=sys.stderr)
     dof = len(water_node_tags)
     return dof, meshname
 
+def createdomainmask(elevationB):
+
+    # bathymetry is -9999 outside domain
+    domainmask = gdal_calc.Calc(
+        calc=["(A!=-9999)"],
+        A=elevationB,
+        outfile="new_data/domainmask_nonresamp.tif",
+        NoDataValue=0,
+        overwrite=True)
+
+     #        outfile="new_data/domainmask_nonresamp.tif",
+
+    #arrdomainmask = domainmask.ReadAsArray()      # <-- this is a numeric np.ndarray
+    seathickness_data = readraster('new_data/seathickness.tif')
+
+
+    domainmask.ReadAsArray() # WTF, why do i need this..!
+
+    # for recropping
+    gt = seathickness_data.GetGeoTransform()
+
+    nx = seathickness_data.RasterXSize
+    ny = seathickness_data.RasterYSize
+
+    xmin = gt[0]
+    xmax = gt[0] + nx * gt[1]
+    ymax = gt[3]
+    ymin = gt[3] + ny * gt[5]   # gt[5] is negative
+
+
+    gdal.Warp(
+        "new_data/domainmask_noncropped.tif",
+        "new_data/domainmask_nonresamp.tif",
+        dstSRS=seathickness_data.GetProjection(),
+        xRes=gt[1],
+        yRes=abs(gt[5]),
+        targetAlignedPixels=True,
+        outputBounds=(xmin, ymin, xmax, ymax),
+        resampleAlg='bilinear'
+    )
+
+    domainmask_resamp = gdal.Open("new_data/domainmask_noncropped.tif")
+
+
+    # CROP
+
+    arrSeaThick = seathickness_data.ReadAsArray()      # <-- this is a numeric np.ndarray
+    domainmask_resamp_band = domainmask_resamp.GetRasterBand(1)
+    arrMask_resamp = domainmask_resamp_band.ReadAsArray()
+
+    # Get shapes
+    nB_y, nB_x = arrMask_resamp.shape
+    nT_y, nT_x = arrSeaThick.shape  # nonresampled data
+
+    print("mask shape:", arrMask_resamp.shape)
+    print("sea thickness shape:", arrSeaThick.shape)
+
+
+    # Common size in each direction
+    n_y = min(nB_y, nT_y)
+    n_x = min(nB_x, nT_x)
+
+    # Crop both arrays to the shared region
+    arrMask_resamp_crop = arrMask_resamp[:n_y, :n_x]
+
+    print("arrMask_resamp_crop:", arrMask_resamp_crop.shape)
+
+    save_array_as_tiff(arrMask_resamp_crop, seathickness_data , 'new_data/domainmask.tif')
+
+
+    return
+
+def plot_xy_shoreline(xy_shoreline):
+    xs = [p[0] for p in xy_shoreline]
+    ys = [p[1] for p in xy_shoreline]
+
+    plt.figure(figsize=(6,6))
+    plt.plot(xs, ys, '-k')    # line plot
+    plt.scatter(xs, ys, s=4)  # points
+    plt.gca().set_aspect('equal', 'box')
+    plt.title("xy_shoreline")
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.show()
+
+
+# EDIT, to compute better shoreline
+def build_seathickness_shoreline(
+    seathickness_path: str,
+    bathymetry_path: str,
+    categories_path: str,
+    domainmask_path: str,
+    shoreline_res: float = 60,
+) -> list[tuple[float, float]]:
+    """
+    Build a shoreline based on where seathickness > 0, but restricted
+    to valid fjord bathymetry and category mask.
+    Returns a list of (x, y) shoreline coordinates.
+    """
+    # 1. Read rasters
+    seathickness_ds = readraster(seathickness_path)        # ice-bottom thickness or draft > 0 in fjord
+    bath_ds         = readraster(bathymetry_path)          # full bathymetry (with -9999 outside)
+    cat_ds          = readraster(categories_path)          # categories: 0 water, 2 land ice, 3 sea ice, etc.
+    domainmask       = readraster(domainmask_path)
+
+    print('shapes')
+    print(seathickness_ds.ReadAsArray().shape)
+    print(bath_ds.ReadAsArray().shape)
+    print(domainmask.ReadAsArray().shape)
+
+
+    # 2. Build a clean binary mask:
+    #    mask = 1 where seathickness>0 AND bathymetry valid & below sea level AND not outside-category junk.
+    seathickness_mask = gdal_calc.Calc(
+        calc=["(A>0) * (B!=-9999) * (B<=0) * (C==1)"],  # optionally multiply by (C==0) if you want only water cells
+        A=seathickness_ds,
+        B=bath_ds,
+        C=domainmask,  # uncomment and extend calc if you want category filtering
+        outfile="new_data/seathickness_mask.tif",
+        NoDataValue=0,
+        overwrite=True,
+    )
+
+    # 3. Build a footprint of the non-zero mask
+    gdal.Footprint(
+        'new_data/seathickness_outline.geojson',
+        seathickness_mask,
+        format="GeoJSON",
+        maxPoints=shoreline_res,
+        srcNodata=0,          # 0 is outside; only >0 area becomes polygons
+    )
+
+    # 4. Extract the main boundary polyline (longest curve)
+    seathickness_lines = get_boundary_string('new_data/seathickness_outline.geojson')
+    seathickness_shoreline = get_main_boundary(seathickness_lines)  # longest curve
+
+    return seathickness_shoreline
+
+
 def main():
     """Batch-generate meshes for a selection of resolutions/settings."""
-    elevation = readraster('../data/gis_data/bathymetry.tif')
-    elevation_band = elevation.GetRasterBand(1)
 
-    SR = osr.SpatialReference(elevation.GetProjection())
-    ogr_ds = ogr.GetDriverByName("ESRI Shapefile").CreateDataSource('new_data/shoreline_py')
-    shoreline_shp = ogr_ds.CreateLayer('shoreline', SR)
+    #READ BATHYMETRY
+    elevationB = readraster('../data/gis_data/bathymetry.tif')
 
-    gdal.ContourGenerateEx(elevation_band, shoreline_shp, 
-                           options = ['LEVEL_INTERVAL = 100000', 'FIXED_LEVELS=0', 'NODATA=-9999'])
+    elevation_band = elevationB.GetRasterBand(1)
+    arrB = elevation_band.ReadAsArray()
 
-    gdal.Rasterize(elevation, shoreline_shp.GetDataset(), burnValues=0)
-    bathymetry = gdal_calc.Calc(calc=["-9999*(B>0) + A*(A<=0)"], A=elevation, 
-                                B=elevation, outfile="new_data/bathymetry.tif", 
-                                NoDataValue=-9999, overwrite=True)
 
-    shoreline_res = 60
+   # plt.figure()
+   # plt.imshow(arrB, cmap='viridis')  # or 'terrain', 'inferno', etc.
+   # plt.colorbar(label='data')
+   # plt.title('origiinal B data')
+   #  plt.show()
 
-    gdal.Footprint('new_data/shorelines.geojson', bathymetry, format="GeoJSON", 
-                   maxPoints = shoreline_res, srcNodata = -9999)
-    shorelines = get_boundary_string('new_data/shorelines.geojson')
-    shoreline = get_main_boundary(shorelines)
+    # COMPUTE SEA DEPTH
+    thickness_data = readraster('../data/thickness.tif')
+    surface_pos_data = readraster('../data/surface_pos.tif')
+    full_bathymetry = readraster('../data/elevation.tif')
 
+
+    # Option 1: from the whole dataset
+    arrT = thickness_data.ReadAsArray()      # <-- this is a numeric np.ndarray
+    arrS = surface_pos_data.ReadAsArray()      # <-- this is a numeric np.ndarray
+    arrBath = full_bathymetry.ReadAsArray()
+    arrB = arrS-arrT
+    seasurface = np.minimum(arrB, 0)
+    arrseathickness = seasurface - arrBath
+
+    save_array_as_tiff(arrB, surface_pos_data , 'new_data/icebottom.tif')
+    save_array_as_tiff(arrseathickness, surface_pos_data , 'new_data/seathickness.tif')
+
+    # Domain mask
+
+    createdomainmask(elevationB)
+
+
+    # BUILD SHORELINE FROM SEA DEPTH
+
+    shoreline = build_seathickness_shoreline(
+    seathickness_path="new_data/seathickness.tif",
+    bathymetry_path="../data/elevation.tif",          # or your full_bathymetry path
+    categories_path="../data/gis_data/categories.tif",
+    domainmask_path="new_data/domainmask.tif",
+    shoreline_res=10,
+    )    
+
+
+    plot_main_geoline(shoreline) #seaice_line  landice_line  grounding_line   outline water_line  intersect shoreline
+    plt.title('new shorelne')
+    plt.show()
+
+   # plot_main_geoline(shoreline)
+    shoreline_res=30
     categories = readraster('../data/gis_data/categories.tif')
 
     seaice = gdal_calc.Calc(calc=["(A==3)"], A=categories, outfile="new_data/water.tif", 
@@ -1614,10 +1930,25 @@ def main():
     
     all_lines = {'Main Outline': outline, 'Grounding Line': grounding_line, 
                 'Water-Ice Intersect': intersect}
-    plot_full_outline(all_lines)
+   
 
-    full_bathymetry = readraster('../data/elevation.tif')
+  
 
+    plot_main_geoline(shoreline) #seaice_line  landice_line  grounding_line   outline water_line  intersect shoreline
+    plt.title('new shorelne')
+    plt.show()
+
+    plot_main_geoline(outline) #seaice_line  landice_line  grounding_line   outline water_line  intersect shoreline
+    plt.title('outlnie')
+    plt.show()
+
+
+
+    #return
+
+    SR = osr.SpatialReference(elevationB.GetProjection())
+    ogr_ds = ogr.GetDriverByName("ESRI Shapefile").CreateDataSource('new_data/shoreline_py')
+    shoreline_shp = ogr_ds.CreateLayer('shoreline', SR)
     gdal.ContourGenerateEx(elevation_band, shoreline_shp, options = ['LEVEL_INTERVAL = 100000', 
                                                                    'FIXED_LEVELS=0', 
                                                                    'NODATA=-9999'])
@@ -1627,8 +1958,8 @@ def main():
 
     sherard = readraster("../data/sherard-osborn-fjord-15m-3996.tiff")
     highres = gdal.Warp('new_data/highres.tif', sherard, dstSRS='EPSG:3413')
-    thickness_data = readraster('../data/thickness.tif')
-    surface_pos_data = readraster('../data/surface_pos.tif')
+    #thickness_data = readraster('../data/thickness.tif')
+    #surface_pos_data = readraster('../data/surface_pos.tif')
     
     dofs = []
     
@@ -1722,7 +2053,7 @@ def main():
         
         
         # Lukas: element size does not do anything at the moment. Mesh size is controlled by LC_MIN, LC_MAX at the top of the script.
-        Scenario(500, 6, 2, False, False, 0, "coarse_test.msh"), # stacked fine
+        Scenario(500, 6, 3, False, False, 0, "coarse_test.msh"), # stacked fine
         
         # Scenario(1000, 6, 2, False, True, 0), # coarse
         # Scenario(470, 1, 2, True, False, 15),
