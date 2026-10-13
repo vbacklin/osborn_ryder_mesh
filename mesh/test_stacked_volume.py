@@ -4,7 +4,7 @@ Run: python -u test_stacked_volume.py
 """
 import numpy as np
 from stacked_volume import (build_stacked_volume, split_prism_to_tets,
-                            TOP, BOTTOM, SIDE)
+                            layers_from_min_thickness, TOP, BOTTOM, SIDE)
 
 FAIL = []
 
@@ -214,6 +214,90 @@ try:
     check("zero-thickness column raises", False, "no exception")
 except ValueError as e:
     check("zero-thickness column raises", "non-positive thickness" in str(e))
+
+# --- 6. variable layer count per column (sweep split) ----------------------
+def verify_variable(name, xy, tris, z_top, z_bot, L, n):
+    print(f"\n--- {name}: {len(xy)} columns, {len(tris)} triangles, "
+          f"layers {n.min()}..{n.max()} (max {L}) ---")
+    m = build_stacked_volume(xy, tris, z_top, z_bot, L, layers_per_column=n)
+    vols = tet_volumes(m.coords, m.tets)
+
+    check("tet count == sum over tris of the 3 columns' layers",
+          len(m.tets) == int(n[tris].sum()), f"{len(m.tets)} vs {int(n[tris].sum())}")
+    check("node count == sum(layers+1)", len(m.coords) == int((n + 1).sum()))
+    check("all tets strictly positive volume", np.all(vols > 0),
+          f"min {vols.min():.6g}")
+    analytic = float(np.sum(tri_area(xy, tris) *
+                            ((z_top - z_bot)[tris].mean(axis=1))))
+    rel = abs(float(vols.sum()) - analytic) / abs(analytic)
+    check("total volume == analytic prism volume", rel < 1e-10, f"rel err {rel:.3e}")
+
+    faces = np.concatenate([m.tets[:, [0, 2, 1]], m.tets[:, [0, 1, 3]],
+                            m.tets[:, [0, 3, 2]], m.tets[:, [1, 2, 3]]])
+    _, cnt = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
+    check("every face used once or twice", set(np.unique(cnt)) <= {1, 2},
+          f"counts {sorted(set(cnt.tolist()))}")
+    be = np.concatenate([m.boundary_faces[:, [0, 1]], m.boundary_faces[:, [1, 2]],
+                         m.boundary_faces[:, [2, 0]]])
+    _, ecnt = np.unique(np.sort(be, axis=1), axis=0, return_counts=True)
+    check("boundary surface is closed", np.all(ecnt == 2),
+          f"{int((ecnt != 2).sum())} open")
+    _, dcnt = np.unique(be, axis=0, return_counts=True)
+    check("boundary orientation consistent", np.all(dcnt == 1))
+
+    bed = boundary_edges_of(tris)
+    check("top cap == #triangles", (m.boundary_kind == TOP).sum() == len(tris))
+    check("bottom cap == #triangles", (m.boundary_kind == BOTTOM).sum() == len(tris))
+    want_side = int(n[bed].sum())
+    check("side walls == sum over boundary edges of both columns' layers",
+          (m.boundary_kind == SIDE).sum() == want_side,
+          f"{(m.boundary_kind == SIDE).sum()} vs {want_side}")
+
+    check("node_col matches coordinates",
+          np.allclose(m.coords[:, :2], xy[m.node_col]))
+    per = np.bincount(m.node_col, minlength=len(xy))
+    check("column c carries layers[c]+1 nodes", np.array_equal(per, n + 1))
+    top = m.coords[m.node_level == 0]
+    check("top level sits on z_top",
+          np.allclose(top[:, 2], z_top[m.node_col[m.node_level == 0]]))
+    return m
+
+
+rng = np.random.default_rng(1)
+z_top = np.where(xy[:, 0] < 2500, -40 - 0.01 * xy[:, 1], 0.0)
+z_bot = -300 - 0.06 * xy[:, 0] - 0.02 * xy[:, 1] + rng.normal(0, 5, len(xy))
+thk = z_top - z_bot
+n_var = layers_from_min_thickness(thk, 38, 12.0)
+verify_variable("sloped, layers from min thickness 12 m", xy, tris, z_top, z_bot,
+                38, n_var)
+n_rand = rng.integers(1, 39, len(xy))
+verify_variable("random 1..38 layers per column", xy, tris, z_top, z_bot, 38, n_rand)
+verify_variable("random layers, permuted column indices", xy[perm], inv_perm[tris],
+                z_top[perm], z_bot[perm], 38, n_rand[perm])
+n_alt = np.where(np.arange(len(xy)) % 2 == 0, 1, 38)
+verify_variable("alternating 1 and 38 layers", xy, tris, z_top, z_bot, 38, n_alt)
+m_u = verify_variable("all columns at max via sweep", xy, tris, z_top, z_bot, 15,
+                      np.full(len(xy), 15))
+check("sweep with uniform layers has 3 tets per prism-layer",
+      len(m_u.tets) == 3 * len(tris) * 15)
+try:
+    zt_u = np.where(upts[:, 0] < 3000, -30.0, 0.0)
+    zb_u = -250 - 0.03 * upts[:, 0] + rng.normal(0, 6, len(upts))
+    verify_variable("unstructured gmsh triangulation, variable layers", upts, utris,
+                    zt_u, zb_u, 38, layers_from_min_thickness(zt_u - zb_u, 38, 10.0))
+except NameError:
+    print("\n(no unstructured triangulation -- skipping)")
+
+print("\n--- invalid layer counts ---")
+for bad, label in ((np.zeros(len(xy), np.int64), "0 layers"),
+                   (np.full(len(xy), 39), "above max")):
+    try:
+        build_stacked_volume(xy, tris, z_top, z_bot, 38, layers_per_column=bad)
+        check(f"{label} raises", False, "no exception")
+    except ValueError:
+        check(f"{label} raises", True)
+check("layers_from_min_thickness clips to [1, L]",
+      list(layers_from_min_thickness([0.5, 25, 1e6], 38, 5.0)) == [1, 5, 38])
 
 print("\n" + ("ALL CHECKS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: {FAIL}"))
 raise SystemExit(1 if FAIL else 0)

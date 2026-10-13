@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["split_prism_to_tets", "build_stacked_volume", "StackedMesh"]
+__all__ = ["split_prism_to_tets", "sweep_prism_to_tets", "build_stacked_volume",
+           "layers_from_min_thickness", "StackedMesh"]
 
 
 def split_prism_to_tets(bot, top, cols):
@@ -66,20 +67,67 @@ def split_prism_to_tets(bot, top, cols):
     return [(v0, v1, v2, v4), (v0, v4, v2, v5), (v0, v4, v5, v3)]
 
 
+def sweep_prism_to_tets(cols, node_ids, sigmas):
+    """Split one prism whose three columns may carry different layer counts.
+
+    `cols` are the three column indices, `node_ids[q]` / `sigmas[q]` the node
+    ids and fractional depths (0 at top, 1 at bottom) of column q, top first.
+
+    The prism is swept from top to bottom.  The current "front" is one node per
+    column, starting at the top triangle.  Each step advances the column whose
+    next node is shallowest -- ties broken by column index -- and emits the tet
+    (front, next node).  Restricted to any two columns, that order depends
+    only on those two columns' sigmas and indices, so the prism on the other
+    side of a shared quad advances them in the same order and triangulates the
+    face identically: conforming without global coordination, the same
+    property split_prism_to_tets gets from its diagonal rule.
+
+    Every tet is (plan triangle) x (one vertical step on one column), so its
+    volume is |dz| * area / 6 > 0 -- it cannot degenerate.
+    """
+    i = [0, 0, 0]
+    n = [len(node_ids[q]) - 1 for q in range(3)]
+    out = []
+    while True:
+        cand = [(sigmas[q][i[q] + 1], cols[q], q) for q in range(3) if i[q] < n[q]]
+        if not cand:
+            return out
+        q = min(cand)[2]
+        out.append((node_ids[0][i[0]], node_ids[1][i[1]], node_ids[2][i[2]],
+                    node_ids[q][i[q] + 1]))
+        i[q] += 1
+
+
+def layers_from_min_thickness(thickness, num_layers, min_layer_thickness):
+    """Layer count per column so no layer is thinner than `min_layer_thickness`
+    (where possible): clip(floor(thickness / min_layer_thickness), 1, L)."""
+    n = np.floor(np.asarray(thickness, float) / float(min_layer_thickness))
+    return np.clip(n, 1, int(num_layers)).astype(np.int64)
+
+
 class StackedMesh:
-    """Result of :func:`build_stacked_volume`."""
+    """Result of :func:`build_stacked_volume`.
+
+    `node_col[i]` / `node_level[i]` give the plan column and level (0 = top)
+    of node i.  `layers[c]` is the layer count of column c; `num_layers` is
+    the maximum.  Use node_col rather than index arithmetic -- the node layout
+    is only `c * (L + 1) + k` when every column has the same count.
+    """
 
     __slots__ = ("coords", "tets", "boundary_faces", "boundary_kind",
-                 "num_layers", "num_columns")
+                 "num_layers", "num_columns", "node_col", "node_level", "layers")
 
     def __init__(self, coords, tets, boundary_faces, boundary_kind,
-                 num_layers, num_columns):
+                 num_layers, num_columns, node_col, node_level, layers):
         self.coords = coords
         self.tets = tets
         self.boundary_faces = boundary_faces
         self.boundary_kind = boundary_kind
         self.num_layers = num_layers
         self.num_columns = num_columns
+        self.node_col = node_col
+        self.node_level = node_level
+        self.layers = layers
 
     def faces_of(self, kind):
         return self.boundary_faces[self.boundary_kind == kind]
@@ -114,7 +162,8 @@ def _derive_boundary(tets):
     return faces[first[counts == 1]]
 
 
-def build_stacked_volume(xy, tris, z_top, z_bot, num_layers):
+def build_stacked_volume(xy, tris, z_top, z_bot, num_layers,
+                         layers_per_column=None):
     """Stack a plan-view triangulation into a layered tetrahedral volume.
 
     Parameters
@@ -130,6 +179,11 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers):
         contaminating these meshes.
     num_layers : int
         Number of sigma layers (>= 1).  Produces `num_layers + 1` levels.
+    layers_per_column : (C,) int, optional
+        Per-column layer count in [1, num_layers].  When given, prisms are
+        split with sweep_prism_to_tets so neighbouring columns may differ;
+        when omitted every column gets `num_layers` and the original
+        diagonal-rule split is used unchanged.
 
     Returns
     -------
@@ -159,6 +213,10 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers):
             f"{int(bad.sum())} of {C} columns have non-positive thickness "
             f"(min {worst:.6g}). Clamp the floor or clip the domain before "
             "stacking -- this construction will not hide a degenerate column.")
+
+    if layers_per_column is not None:
+        return _build_variable(xy, tris, z_top, z_bot, L,
+                               np.asarray(layers_per_column, np.int64))
 
     # --- nodes: regular (column, level) grid, level 0 at the top -------------
     sigma = np.linspace(0.0, 1.0, L + 1)                 # (L+1,)
@@ -203,4 +261,50 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers):
     kind[np.all(lvl == 0, axis=1)] = TOP
     kind[np.all(lvl == L, axis=1)] = BOTTOM
 
-    return StackedMesh(coords, tets, bfaces, kind, L, C)
+    node_col = np.repeat(np.arange(C), L + 1)
+    node_level = np.tile(np.arange(L + 1), C)
+    return StackedMesh(coords, tets, bfaces, kind, L, C, node_col, node_level,
+                       np.full(C, L, np.int64))
+
+
+def _build_variable(xy, tris, z_top, z_bot, L, n):
+    C = len(xy)
+    if n.shape != (C,):
+        raise ValueError("layers_per_column must be (C,)")
+    if n.min() < 1 or n.max() > L:
+        raise ValueError(f"layers_per_column must lie in [1, {L}], "
+                         f"got [{n.min()}, {n.max()}]")
+    thickness = z_top - z_bot
+
+    off = np.concatenate([[0], np.cumsum(n + 1)])
+    node_col = np.repeat(np.arange(C), n + 1)
+    node_level = np.arange(off[-1]) - off[node_col]
+    sig = node_level / n[node_col]
+    coords = np.column_stack([xy[node_col, 0], xy[node_col, 1],
+                              z_top[node_col] - sig * thickness[node_col]])
+    sigmas = [sig[off[c]:off[c + 1]] for c in range(C)]
+    ids = [np.arange(off[c], off[c + 1]) for c in range(C)]
+
+    tets = []
+    for tri in tris:
+        cols = (int(tri[0]), int(tri[1]), int(tri[2]))
+        tets.extend(sweep_prism_to_tets(cols, [ids[c] for c in cols],
+                                        [sigmas[c] for c in cols]))
+    tets = np.asarray(tets, np.int64)
+
+    p = coords[tets]
+    vol = np.einsum('ij,ij->i',
+                    np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]),
+                    p[:, 3] - p[:, 0]) / 6.0
+    if not np.all(np.abs(vol) > 0):
+        raise ValueError(f"{int((vol == 0).sum())} tets have zero volume")
+    flip = vol < 0
+    tets[flip] = tets[flip][:, [0, 2, 1, 3]]
+
+    bfaces = _derive_boundary(tets)
+    lvl = node_level[bfaces]
+    bottom_lvl = n[node_col[bfaces]]
+    kind = np.full(bfaces.shape[0], SIDE, dtype=np.int8)
+    kind[np.all(lvl == 0, axis=1)] = TOP
+    kind[np.all(lvl == bottom_lvl, axis=1)] = BOTTOM
+    return StackedMesh(coords, tets, bfaces, kind, L, C, node_col, node_level, n)

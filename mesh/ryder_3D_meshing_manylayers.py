@@ -19,7 +19,8 @@ except locale.Error as e:
 
 import gmsh
 import meshio
-from stacked_volume import build_stacked_volume, TOP, BOTTOM, SIDE
+from stacked_volume import (build_stacked_volume, layers_from_min_thickness,
+                            TOP, BOTTOM, SIDE)
 from typing import Dict, NamedTuple, Sequence, List, Optional, Union
 from pathlib import Path
 import subprocess, sys
@@ -74,6 +75,16 @@ MIN_STACK_THICKNESS = float(os.environ.get("MIN_STACK_THICKNESS", 10.0))
 # Select the meshing path: 1 = direct prism stacking (no TetGen), 0 = the
 # original skin + TetGen route.
 USE_STACKED = int(os.environ.get("USE_STACKED", 0))
+SHORELINE_RES = int(os.environ.get("SHORELINE_RES", 30))
+
+# Stacked path only: thinnest layer allowed, in true (unscaled) metres.  A
+# column of thickness H gets clip(floor(H / MIN_LAYER_THICKNESS), 1, NUM_LAYERS)
+# layers, so the thin columns at the shoreline / grounding line carry fewer,
+# thicker layers instead of 38 slivers.  0 = every column gets NUM_LAYERS.
+# Default 10 m: grounding-line tets with gamma<0.01 drop from 30% to 0.1% at
+# h=500 (mesh_diagnostics/quality_by_region.py); columns under ~380 m get
+# fewer than 38 layers.
+MIN_LAYER_THICKNESS = float(os.environ.get("MIN_LAYER_THICKNESS", 10.0))
 
 WATER_SURFACE_TAG = 5
 ICE_TAG = 1
@@ -2540,12 +2551,19 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
               flush=True)
         z_bot[thin] = z_top[thin] - floor_limit
 
+    layers = None
+    if MIN_LAYER_THICKNESS > 0:
+        layers = layers_from_min_thickness(z_top - z_bot, num_of_layers,
+                                           MIN_LAYER_THICKNESS)
+        print(f"[STACKED] MIN_LAYER_THICKNESS={MIN_LAYER_THICKNESS:g} m: "
+              f"{int((layers < num_of_layers).sum())} of {C} columns get fewer "
+              f"than {num_of_layers} layers (min {int(layers.min())})", flush=True)
     sm = build_stacked_volume(xy, tris, scale * z_top, scale * z_bot,
-                              num_of_layers)
+                              num_of_layers, layers_per_column=layers)
     L = sm.num_layers
 
     # --- classify the derived boundary into physical groups ------------------
-    cols = sm.boundary_faces // (L + 1)
+    cols = sm.node_col[sm.boundary_faces]
     is_top = sm.boundary_kind == TOP
     is_bottom = sm.boundary_kind == BOTTOM
     is_side = sm.boundary_kind == SIDE
@@ -2601,7 +2619,10 @@ def main():
 
     createdomainmask(elevation)
 
-    shoreline_res = 30
+    # Vertex budget for gdal.Footprint on the thickness mask.  30 gives ~4.5 km
+    # chords over the 135 km shoreline, which cut across the true contour in
+    # both directions (deep water cut off, sub-threshold water enclosed).
+    shoreline_res = SHORELINE_RES
 
     shoreline = build_seathickness_shoreline(
         seathickness_path="new_data/seathickness.tif",
@@ -2616,7 +2637,9 @@ def main():
     # Cache is keyed on SHORELINE_MIN_THICKNESS: the saved boundary is only
     # valid for the threshold it was derived with, so a different threshold
     # gets its own file rather than silently reusing the old shoreline.
-    _saved_shore = Path(f"new_data/saved_shoreline_t{SHORELINE_MIN_THICKNESS:g}.json")
+    _saved_shore = Path(f"new_data/saved_shoreline_t{SHORELINE_MIN_THICKNESS:g}"
+                        + ("" if shoreline_res == 30 else f"_r{shoreline_res:g}")
+                        + ".json")
     if _saved_shore.exists():
         import json
         shoreline = json.loads(_saved_shore.read_text())
@@ -2719,11 +2742,15 @@ def main():
     # env vars). The output filename encodes all three so runs at different
     # settings never overwrite each other.
     _n_layers = int(os.environ.get("NUM_LAYERS", 15))
+    _element_size = float(os.environ.get("ELEMENT_SIZE", 2000))
     sweep = [
-        Scenario(2000, 6, _n_layers, False, False, 0,
+        Scenario(_element_size, 6, _n_layers, False, False, 0,
                  ("stacked" if USE_STACKED else "sweep")
                  + f"_layers{_n_layers}_t{SHORELINE_MIN_THICKNESS:g}"
-                 + f"_c{MIN_WATER_COLUMN:g}.msh"),
+                 + f"_c{MIN_WATER_COLUMN:g}_h{_element_size:g}"
+                 + ("" if SHORELINE_RES == 30 else f"_r{SHORELINE_RES}")
+                 + (f"_dz{MIN_LAYER_THICKNESS:g}" if MIN_LAYER_THICKNESS > 0 else "")
+                 + ".msh"),
     ]
 
     params = sweep
