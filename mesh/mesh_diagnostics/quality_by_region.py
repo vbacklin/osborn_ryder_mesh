@@ -11,7 +11,7 @@ Alongside gamma it reports the two things that drive it in a sigma mesh:
 column thickness and layer slope (|grad z| of the prism's top face).
 z in the file is scaled by SCALE; thickness is reported unscaled.
 
-usage: python mesh_diagnostics/quality_by_region.py MESH.msh [h] [SCALE]
+usage: python mesh_diagnostics/quality_by_region.py MESH.msh [h] [SCALE=1]
 """
 import sys
 import numpy as np
@@ -19,7 +19,7 @@ import gmsh
 
 path = sys.argv[1]
 H = float(sys.argv[2]) if len(sys.argv) > 2 else 500.0
-SCALE = float(sys.argv[3]) if len(sys.argv) > 3 else 6.0
+SCALE = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
 ICE, BATH, INFLOW, WATER = 1, 2, 4, 5
 
 gmsh.initialize()

@@ -20,7 +20,7 @@ except locale.Error as e:
 import gmsh
 import meshio
 from stacked_volume import (build_stacked_volume, layers_from_min_thickness,
-                            TOP, BOTTOM, SIDE)
+                            TOP, BOTTOM, SIDE, CALVING)
 from typing import Dict, NamedTuple, Sequence, List, Optional, Union
 from pathlib import Path
 import subprocess, sys
@@ -64,7 +64,40 @@ EMBED_SIGMA_SEEDS = int(os.environ.get("EMBED_SIGMA_SEEDS", 1))
 # Overridable per-run via the SHORELINE_MIN_THICKNESS environment variable so
 # the threshold can be swept without editing this file; the shoreline cache is
 # keyed on this value (see main()), so changing it never reuses a stale boundary.
-SHORELINE_MIN_THICKNESS = float(os.environ.get("SHORELINE_MIN_THICKNESS", 10.0))
+SHORELINE_MIN_THICKNESS = float(os.environ.get("SHORELINE_MIN_THICKNESS", 30.0))
+
+# Same clip, but for water *under ice* (thickness.tif > 0).  Near the fjord walls
+# the shelf data is not measured: the ice draft is exactly hydrostatic and ~13% of
+# the shelf has a filler bed of "ice base - 10 m", so the cavity ramps up through
+# thin sloping wedges where the shelf in reality rests on the walls.  A higher
+# threshold here starts the domain where the cavity is well defined.  75 m is the
+# lowest value that keeps every 10 m filler pixel out of the domain (h=500: 0
+# inverted tets, quality unchanged); set it equal to SHORELINE_MIN_THICKNESS to
+# turn the separate treatment off.
+SHELF_MIN_THICKNESS = float(os.environ.get("SHELF_MIN_THICKNESS", 75.0))
+
+# Pull the boundary this far (m) inward from the threshold contour before it is
+# traced.  The fjord walls are cliffs: water goes from 0 to >100 m within one or
+# two 150 m pixels, so the 30 m and 100 m contours are nearly the same line and
+# raising a threshold barely moves the boundary.  Walking a few pixels in
+# lands it on the deep side instead.  At 300 m (75 m clip), boundary samples
+# with <10 m of water drop from 19% to 0.3% for ~6% of the area.  The margin is
+# not applied where the domain ends at the data edge (the ocean mouth).
+SHORELINE_MARGIN = float(os.environ.get("SHORELINE_MARGIN", 300.0))
+
+# Shoreline vertex density.  The boundary is traced at full pixel resolution
+# and then simplified (Douglas-Peucker) with a per-vertex tolerance: tight
+# where ice is within ~450 m (the grounding line), loose elsewhere.  Below
+# ~100 m the polygon follows the 150 m pixel staircase, so do not go lower.
+# SHORELINE_GL_TOL=0 falls back to gdal.Footprint with SHORELINE_RES vertices.
+SHORELINE_GL_TOL = float(os.environ.get("SHORELINE_GL_TOL", 150.0))
+SHORELINE_TOL = float(os.environ.get("SHORELINE_TOL", 600.0))
+
+# 1 = open an interactive editor on the shoreline polygon before meshing (drag,
+# insert, delete vertices; close the window to save).  It starts from the saved
+# polygon for the current thresholds if there is one, else from the automatic
+# contour, and writes the result back to that cache file.
+SHORELINE_EDIT = int(os.environ.get("SHORELINE_EDIT", 0))
 
 # Minimum column thickness the direct prism-stacking path will accept.  Unlike
 # the TetGen path, build_stacked_volume refuses to mesh a collapsed column
@@ -74,7 +107,7 @@ MIN_STACK_THICKNESS = float(os.environ.get("MIN_STACK_THICKNESS", 10.0))
 
 # Select the meshing path: 1 = direct prism stacking (no TetGen), 0 = the
 # original skin + TetGen route.
-USE_STACKED = int(os.environ.get("USE_STACKED", 0))
+USE_STACKED = int(os.environ.get("USE_STACKED", 1))
 SHORELINE_RES = int(os.environ.get("SHORELINE_RES", 30))
 
 # Stacked path only: thinnest layer allowed, in true (unscaled) metres.  A
@@ -86,10 +119,26 @@ SHORELINE_RES = int(os.environ.get("SHORELINE_RES", 30))
 # fewer than 38 layers.
 MIN_LAYER_THICKNESS = float(os.environ.get("MIN_LAYER_THICKNESS", 10.0))
 
+# Vertical stretching under the ice (stacked path): in ice-covered columns the
+# first layer below the ice base is ICE_TOP_LAYER m thick and each layer below
+# is a constant factor thicker (at most LAYER_GROWTH), so the plume boundary
+# layer is resolved and the deep cavity is coarse.  0 = evenly spaced layers.
+ICE_TOP_LAYER = float(os.environ.get("ICE_TOP_LAYER", 5.0))
+LAYER_GROWTH = float(os.environ.get("LAYER_GROWTH", 1.2))
+
 WATER_SURFACE_TAG = 5
 ICE_TAG = 1
 BATHYMETRY_TAG = 2
 INFLOW_TAG = 4
+# Boundary tag of the vertical calving face.  Defaults to the ice tag, so the
+# solver treats the front like the ice base; set 7 to keep it separate.
+CALVING_FRONT_TAG = int(os.environ.get("CALVING_FRONT_TAG", ICE_TAG))
+
+# Stacked path: build the calving front as a vertical face (sea surface down to
+# the ice draft) instead of a ramp across one element.  0 = old ramp.
+CALVING_FRONT = int(os.environ.get("CALVING_FRONT", 1))
+# Front columns whose draft is shallower than this (m) get no vertical face.
+MIN_FRONT_DRAFT = 1.0
 INFLOW_LINE_TAG = 3
 SURFACE_PHYSICAL_TAGS = (ICE_TAG, BATHYMETRY_TAG, INFLOW_TAG, WATER_SURFACE_TAG)
 GMESH_NUM_THREADS = 10
@@ -131,41 +180,49 @@ def ensure_msh_path(name: Union[str, Path]) -> str:
 
 
 def write_legacy_xdmf(msh_path: Union[str, Path]) -> Path:
-    """Write an XDMF companion file with physical tags preserved for FEniCS."""
+    """Write the mesh as two XDMF files, the way legacy FEniCS reads them.
 
+    ``<stem>_volume.xdmf``  tetrahedra, ``name_to_read`` = volume tag
+    ``<stem>_surface.xdmf`` boundary triangles, ``name_to_read`` = boundary tag
+    (the same split poisson/model_poisson.py makes from the .msh).
+
+    A single file holding both cell types is a "Mixed" topology: legacy dolfin
+    cannot read it, and ParaView draws the tets' outer faces on top of the
+    tagged boundary triangles, so the boundary colouring looks patchy.
+    Returns the surface file path.
+    """
     msh_path = Path(msh_path)
-    xdmf_path = msh_path.with_suffix(".xdmf")
     msh = meshio.read(msh_path)
+    tags = msh.cell_data.get("gmsh:physical")
+    if tags is None:
+        raise ValueError(f"{msh_path} has no gmsh:physical cell data")
 
-    cells: List[tuple[str, np.ndarray]] = []
-    cell_data: Dict[str, List[np.ndarray]] = {name: [] for name in msh.cell_data.keys()}
+    def collect(kind):
+        blocks = [(c.data, np.asarray(t, dtype=np.int32))
+                  for c, t in zip(msh.cells, tags) if c.type == kind]
+        if not blocks:
+            return None, None
+        return (np.concatenate([b[0] for b in blocks]),
+                np.concatenate([b[1] for b in blocks]))
 
-    for idx, cell_block in enumerate(msh.cells):
-        if cell_block.type not in ("triangle", "tetra"):
+    written = []
+    for kind, suffix in (("tetra", "_volume"), ("triangle", "_surface")):
+        cells, data = collect(kind)
+        if cells is None:
             continue
-        cells.append((cell_block.type, cell_block.data))
-        for name, data_list in msh.cell_data.items():
-            arr = data_list[idx]
-            cell_data[name].append(np.asarray(arr, dtype=np.int32))
-
-    if not cells:
+        path = msh_path.with_name(msh_path.stem + suffix + ".xdmf")
+        meshio.write(path, meshio.Mesh(points=msh.points, cells=[(kind, cells)],
+                                       cell_data={"name_to_read": [data]}),
+                     file_format="xdmf")
+        written.append(path)
+    if not written:
         raise ValueError(f"{msh_path} contains no tetra or triangle cells to export.")
-
-    if "name_to_read" not in cell_data and "gmsh:physical" in cell_data:
-        cell_data["name_to_read"] = [np.array(arr, dtype=np.int32) for arr in cell_data["gmsh:physical"]]
-
-    meshio.write(
-        xdmf_path,
-        meshio.Mesh(
-            points=msh.points,
-            cells=cells,
-            cell_data=cell_data,
-            field_data=msh.field_data,
-        ),
-        file_format="xdmf",
-    )
-
-    return xdmf_path
+    # Drop a stale mixed-topology companion from earlier runs.
+    old = msh_path.with_suffix(".xdmf")
+    for stale in (old, old.with_suffix(".h5")):
+        if stale.exists():
+            stale.unlink()
+    return written[-1]
 
 # --- Mesh sizing and quality parameters (easy to tweak) ----------------------
 
@@ -406,6 +463,50 @@ def get_main_boundary(boundary, no=0):
     
     return coords
 
+def inflow_segments(coords, category_array, category_trans, offset=300.0,
+                    step=150.0, min_fraction=0.5):
+    """Flag each polygon edge (coords[i-1], coords[i]) that is an open-ocean inflow.
+
+    An edge is inflow when the ground just *outside* it (sampled every `step`
+    along the edge, `offset` beyond it) is category 6.  The old rule asked for
+    both endpoints to sit on/next to category 6, which breaks whenever the
+    polygon is redrawn: Footprint moves vertices by a pixel or two, and a mouth
+    endpoint that lands on water drops the whole 16 km mouth.  Sampling along
+    the edge does not depend on where the vertices fall.
+
+    Returns a list `flags` with flags[i] for the edge ending at coords[i]
+    (flags[0] is the closing edge coords[-1] -> coords[0]).
+    """
+    from matplotlib.path import Path as _MplPath
+    pts = np.asarray(coords, dtype=float)
+    poly = _MplPath(pts)
+    ny, nx = category_array.shape
+
+    def cat_at(x, y):
+        c = int(np.floor((x - category_trans[0]) / category_trans[1]))
+        r = int(np.floor((y - category_trans[3]) / category_trans[5]))
+        return category_array[r, c] if 0 <= r < ny and 0 <= c < nx else -1
+
+    flags = []
+    for i in range(len(pts)):
+        a, b = pts[i - 1], pts[i]
+        length = float(np.hypot(*(b - a)))
+        if length == 0:
+            flags.append(False)
+            continue
+        normal = np.array([-(b - a)[1], (b - a)[0]]) / length
+        k = max(2, int(length / step))
+        hits = 0
+        for t in (np.arange(k) + 0.5) / k:
+            q = a + t * (b - a)
+            out = q + offset * normal
+            if poly.contains_point(out):
+                out = q - offset * normal
+            hits += cat_at(*out) == 6
+        flags.append(hits / k >= min_fraction)
+    return flags
+
+
 def point_in_set(point, line, tol=1e-6):
     """Return True if `point` already exists (within `tol`) in `line`."""
     
@@ -509,6 +610,116 @@ def find_closest_point(x, y, points):
     closest_point_tag = min(distances, key = distances.get)
     
     return closest_point_tag
+
+def clip_front_to_outline(outline, front):
+    """Make the ice-front polyline end exactly on the domain outline.
+
+    The front comes from the uncut water/sea-ice outlines, so its ends lie at
+    the true fjord walls -- outside the clipped domain.  generate_2D_mesh joins
+    each end to the *nearest outline vertex*; with a dense outline that join
+    can cross the boundary ("Unable to recover the edge").  Here the front is
+    cut to its longest stretch inside the outline and the two crossing points
+    become outline vertices (reusing an existing vertex when the crossing is
+    on one); the returned front starts and ends exactly on them, which
+    generate_2D_mesh recognises.
+
+    Returns (outline, front) with the front running from the lower to the
+    higher inserted vertex index, as generate_2D_mesh expects.
+    """
+    from matplotlib.path import Path as _MplPath
+    P = np.asarray(outline, dtype=float)
+    F = np.asarray(front, dtype=float)
+    inside = _MplPath(P).contains_points(F)
+    if not inside.any():
+        raise RuntimeError("ice front lies entirely outside the domain outline")
+    # longest run of consecutive inside points
+    best, cur = (0, 0), None
+    for i, ok in enumerate(inside):
+        if ok and cur is None:
+            cur = i
+        if (not ok or i == len(F) - 1) and cur is not None:
+            end = i if ok else i - 1
+            if end - cur > best[1] - best[0]:
+                best = (cur, end)
+            cur = None
+    i0, i1 = best
+
+    def hit(a, b):
+        """First crossing of segment a->b (b beyond a) with the outline."""
+        d = b - a
+        best_t, best_e, best_p = np.inf, None, None
+        for e in range(len(P)):
+            q0, q1 = P[e], P[(e + 1) % len(P)]
+            r = q1 - q0
+            den = d[0] * r[1] - d[1] * r[0]
+            if abs(den) < 1e-12:
+                continue
+            w = q0 - a
+            t = (w[0] * r[1] - w[1] * r[0]) / den
+            u = (w[0] * d[1] - w[1] * d[0]) / den
+            if t > 1e-9 and -1e-9 <= u <= 1 + 1e-9 and t < best_t:
+                best_t, best_e, best_p = t, e, a + t * d
+        return best_e, best_p
+
+    def outward(i, step):
+        j = i - step
+        if 0 <= j < len(F) and not inside[j]:
+            return F[i], F[j]                    # real segment to the outside
+        k = i + step                             # front ends inside: extend it
+        nb = F[k] if 0 <= k < len(F) else F[i] - (F[i] - F[i - step])
+        return F[i], F[i] + 1e4 * (F[i] - nb) / max(np.hypot(*(F[i] - nb)), 1e-9)
+
+    e1, p1 = hit(*outward(i0, 1))
+    e2, p2 = hit(*outward(i1, -1))
+    if e1 is None or e2 is None:
+        raise RuntimeError("could not intersect the ice front with the outline")
+
+    pts = [tuple(x) for x in P.tolist()]
+    snap = 1.0   # m: a crossing this close to an outline vertex *is* that vertex
+
+    def place(p):
+        """Index of p in the outline, inserting it on its edge if it is new."""
+        d = np.hypot(*(np.asarray(pts) - p).T)
+        if d.min() < snap:
+            return pts[int(d.argmin())]
+        for e in range(len(pts)):
+            q0, q1 = np.asarray(pts[e]), np.asarray(pts[(e + 1) % len(pts)])
+            r = q1 - q0
+            t = float(np.dot(p - q0, r) / max(np.dot(r, r), 1e-12))
+            if -1e-9 <= t <= 1 + 1e-9 and np.hypot(*(q0 + t * r - p)) < snap:
+                pts.insert(e + 1, tuple(p))
+                return tuple(p)
+        raise RuntimeError(f"front crossing {p} is not on the outline")
+
+    p1 = np.asarray(place(p1))
+    p2 = np.asarray(place(p2))
+    run = [tuple(x) for x in F[i0:i1 + 1].tolist()]
+
+    O = np.asarray(pts, dtype=float)
+    O2 = np.roll(O, -1, axis=0)
+
+    def dist_to_outline(q):
+        q = np.asarray(q)
+        d = O2 - O
+        t = np.clip(((q - O) * d).sum(1) / np.maximum((d ** 2).sum(1), 1e-12), 0, 1)
+        return float(np.min(np.hypot(*(O + t[:, None] * d - q).T)))
+
+    # Both lines come from pixel edges, so a front point can sit *on* the
+    # outline; joining to it runs along the boundary and gives zero-area
+    # triangles.  Keep only points clearly inside.
+    clear = 1.0
+    run = [q for q in run if dist_to_outline(q) >= clear]
+    run = [tuple(p1)] + run + [tuple(p2)]
+    if pts.index(tuple(p1)) == pts.index(tuple(p2)):
+        raise RuntimeError("both ends of the ice front land on one outline vertex")
+    k1, k2 = pts.index(tuple(p1)), pts.index(tuple(p2))
+    if k1 > k2:
+        run = run[::-1]
+    print(f"[FRONT] ice front clipped to the outline: {len(run) - 2} interior points, "
+          f"ends inserted as outline vertices {min(k1, k2)} and {max(k1, k2)}",
+          flush=True)
+    return [list(q) for q in pts], [list(q) for q in run]
+
 
 def get_water_ice_intersect(seaice, water):
     """Return the shared polyline between the water and sea-ice outlines."""
@@ -831,7 +1042,12 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     """
     
     gmsh.initialize()
-    gmsh.option.setNumber("General.NumThreads", GMESH_NUM_THREADS)
+    # The plan-view mesh takes well under a second, and multithreaded 2D
+    # meshing is both nondeterministic (column count varied run to run) and
+    # crashed intermittently (segfault right after "Meshing 2D"), so the
+    # stacked path meshes it on one thread.
+    gmsh.option.setNumber("General.NumThreads",
+                          1 if planar_only else GMESH_NUM_THREADS)
     gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
 
     model = gmsh.model
@@ -899,6 +1115,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     lines = []
     inflow_lines = []
     grounding_lines = []
+    edge_is_inflow = inflow_segments(coords, category_array, category_trans)
     
     point = model.geo.addPoint(first_point[0], first_point[1], 0, sizes[1])
     i = 1
@@ -913,8 +1130,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
         line = model.geo.addLine(point - 1, point)
         lines.append(line)
         
-        if (check_if_inflow(coords[i-1], category_array, category_trans)
-            and check_if_inflow(coords[i], category_array, category_trans)):
+        if edge_is_inflow[i]:
             inflow_lines.append((1, line))
         elif (point_in_set(coords[i-1], grounding_points)
               and point_in_set(coords[i], grounding_points)):
@@ -929,8 +1145,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
     lines.append(line)
     closing_seg_line = line  # the outer ocean boundary (16 km face at max X)
 
-    if (check_if_inflow(first_point, category_array, category_trans)
-            and check_if_inflow(coords[-1], category_array, category_trans)):
+    if edge_is_inflow[0]:
         inflow_lines.append((1, line))
 
     lines_interface = []
@@ -969,16 +1184,26 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
             map_fake_to_real[point] = tag1
             link_fake_to_real[point] = -line
 
-    point = model.geo.addPoint(p1[0], p1[1], 0, sizes[1])
-    line = model.geo.addLine(tag1_eff, point)
-    lines_interface.append(line)
-    if delta is not None and tag1_eff == tag1:
-        map_fake_to_real[point] = tag1
-        flat_points_fake.update([(0, point)])
-        link_fake_to_real[point] = -line
-    for point in intersect_points[1:]:
-        point = model.geo.addPoint(point[0], point[1], 0, sizes[1])
-        line = model.geo.addLine(point - 1, point)
+    # clip_front_to_outline makes the front start/end *on* outline vertices;
+    # then the interface starts there instead of adding a joining line.
+    same1 = (delta is None and
+             math.hypot(p1[0] - coords[tag1 - 1][0], p1[1] - coords[tag1 - 1][1]) < 1e-6)
+    same2 = (delta is None and
+             math.hypot(p2[0] - coords[tag2 - 1][0], p2[1] - coords[tag2 - 1][1]) < 1e-6)
+    if same1:
+        point = tag1
+    else:
+        point = model.geo.addPoint(p1[0], p1[1], 0, sizes[1])
+        line = model.geo.addLine(tag1_eff, point)
+        lines_interface.append(line)
+        if delta is not None and tag1_eff == tag1:
+            map_fake_to_real[point] = tag1
+            flat_points_fake.update([(0, point)])
+            link_fake_to_real[point] = -line
+    for q in intersect_points[1:len(intersect_points) - (1 if same2 else 0)]:
+        prev = point
+        point = model.geo.addPoint(q[0], q[1], 0, sizes[1])
+        line = model.geo.addLine(prev, point)
         lines_interface.append(line)
     if delta is not None:
         q2 = coords[tag2-1]
@@ -1010,10 +1235,11 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
 
         map_fake_to_real[point] = tag2
         flat_points_fake.update([(0, point)])
-    line = model.geo.addLine(point, tag2)
-    lines_interface.append(line)
-    if delta is not None:
-        link_fake_to_real[point] = line
+    if point != tag2:
+        line = model.geo.addLine(point, tag2)
+        lines_interface.append(line)
+        if delta is not None:
+            link_fake_to_real[point] = line
 
     model.geo.synchronize()
 
@@ -1579,7 +1805,7 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
 
     try:
         xdmf_path = write_legacy_xdmf(mesh_filename)
-        print(f"Wrote XDMF companion for FEniCS: {xdmf_path}")
+        print(f"Wrote XDMF for FEniCS/ParaView: {xdmf_path} (+ _volume.xdmf)")
     except Exception as err:
         print(f"[ryder_3D_meshing] Failed to write XDMF next to {mesh_filename}: {err}", file=sys.stderr)
     
@@ -2050,7 +2276,7 @@ def generate_mesh_mult(outline, intersect, grounding_line, m, eps, category_data
     gmsh.finalize()
     try:
         xdmf_path = write_legacy_xdmf(output_path)
-        print(f"Wrote XDMF companion for FEniCS: {xdmf_path}")
+        print(f"Wrote XDMF for FEniCS/ParaView: {xdmf_path} (+ _volume.xdmf)")
     except Exception as err:
         print(f"[ryder_3D_meshing] Failed to write XDMF next to {output_path}: {err}", file=sys.stderr)
     dof = len(water_node_tags)
@@ -2217,6 +2443,11 @@ def build_seathickness_shoreline(
     domainmask_path: str,
     shoreline_res: float = 60,
     min_thickness: float = SHORELINE_MIN_THICKNESS,
+    thickness_path: Optional[str] = None,
+    shelf_min_thickness: Optional[float] = None,
+    margin: float = 0.0,
+    gl_tolerance: float = 0.0,
+    tolerance: float = 600.0,
 ) -> list[tuple[float, float]]:
     """
     Build a shoreline based on where seathickness > min_thickness, but
@@ -2232,28 +2463,137 @@ def build_seathickness_shoreline(
     cat_ds          = readraster(categories_path)
     domainmask       = readraster(domainmask_path)
 
-    seathickness_mask = gdal_calc.Calc(
-        calc=[f"(A>{min_thickness}) * (B!=-9999) * (B<=0) * (C==1)"],
-        A=seathickness_ds,
-        B=bath_ds,
-        C=domainmask,
-        outfile="new_data/seathickness_mask.tif",
-        NoDataValue=0,
-        overwrite=True,
-    )
+    if shelf_min_thickness is None or thickness_path is None:
+        shelf_min_thickness = min_thickness
+    if shelf_min_thickness == min_thickness:
+        seathickness_mask = gdal_calc.Calc(
+            calc=[f"(A>{min_thickness}) * (B!=-9999) * (B<=0) * (C==1)"],
+            A=seathickness_ds,
+            B=bath_ds,
+            C=domainmask,
+            outfile="new_data/seathickness_mask.tif",
+            NoDataValue=0,
+            overwrite=True,
+        )
+    else:
+        # Separate threshold where there is ice on top (D = ice thickness).
+        ice_ds = readraster(thickness_path)
+        seathickness_mask = gdal_calc.Calc(
+            calc=[f"(A > (D>0)*{shelf_min_thickness} + (D<=0)*{min_thickness})"
+                  f" * (B!=-9999) * (B<=0) * (C==1)"],
+            A=seathickness_ds,
+            B=bath_ds,
+            C=domainmask,
+            D=ice_ds,
+            outfile="new_data/seathickness_mask.tif",
+            NoDataValue=0,
+            overwrite=True,
+        )
+
+    if margin > 0:
+        seathickness_mask = _erode_mask_from_shore(
+            seathickness_mask, domainmask, margin,
+            "new_data/seathickness_mask_margin.tif")
 
     gdal.Footprint(
         'new_data/seathickness_outline.geojson',
         seathickness_mask,
         format="GeoJSON",
-        maxPoints=shoreline_res,
+        maxPoints="unlimited" if gl_tolerance > 0 else shoreline_res,
         srcNodata=0,
     )
 
     seathickness_lines = get_boundary_string('new_data/seathickness_outline.geojson')
     seathickness_shoreline = get_main_boundary(seathickness_lines)
 
+    if gl_tolerance > 0:
+        if thickness_path is None:
+            raise ValueError("gl_tolerance needs thickness_path to find the ice")
+        seathickness_shoreline = _simplify_near_ice(
+            seathickness_shoreline, readraster(thickness_path),
+            gl_tolerance, tolerance)
+
     return seathickness_shoreline
+
+
+def _simplify_near_ice(ring, ice_ds, tol_ice, tol_open, ice_reach_px=3):
+    """Douglas-Peucker on a closed ring with a per-vertex tolerance.
+
+    Vertices within `ice_reach_px` pixels of ice (thickness > 0) use `tol_ice`,
+    all others `tol_open`, so the grounding line keeps many vertices and the
+    open shore few.
+    """
+    pts = np.asarray(ring, dtype=float)
+    n = len(pts)
+    gt = ice_ds.GetGeoTransform()
+    ice = ice_ds.ReadAsArray() > 0
+    for _ in range(ice_reach_px):
+        grown = ice.copy()
+        grown[1:] |= ice[:-1]; grown[:-1] |= ice[1:]
+        grown[:, 1:] |= ice[:, :-1]; grown[:, :-1] |= ice[:, 1:]
+        ice = grown
+    c = np.clip(np.floor((pts[:, 0] - gt[0]) / gt[1]).astype(int), 0, ice.shape[1] - 1)
+    r = np.clip(np.floor((pts[:, 1] - gt[3]) / gt[5]).astype(int), 0, ice.shape[0] - 1)
+    tol = np.where(ice[r, c], tol_ice, tol_open).astype(float)
+
+    keep = np.zeros(n, bool)
+    far = int(np.argmax(np.hypot(*(pts - pts[0]).T)))
+    keep[[0, far]] = True
+    stack = [(0, far), (far, n)]
+    while stack:
+        a, b = stack.pop()
+        idx = np.arange(a + 1, b)
+        if len(idx) == 0:
+            continue
+        A, B = pts[a], pts[b % n]
+        AB = B - A
+        L = float(np.hypot(*AB))
+        P = pts[idx % n]
+        if L > 0:
+            dev = np.abs(AB[0] * (P[:, 1] - A[1]) - AB[1] * (P[:, 0] - A[0])) / L
+        else:
+            dev = np.hypot(*(P - A).T)
+        ratio = dev / tol[idx % n]
+        k = int(np.argmax(ratio))
+        if ratio[k] > 1:
+            m = int(idx[k])
+            keep[m % n] = True
+            stack += [(a, m), (m, b)]
+    out = pts[keep]
+    print(f"[SHORELINE] simplified {n} -> {len(out)} vertices "
+          f"({int((keep & (tol == tol_ice)).sum())} near ice; tolerance "
+          f"{tol_ice:g} m near ice, {tol_open:g} m elsewhere)", flush=True)
+    return out.tolist()
+
+
+def _erode_mask_from_shore(mask_ds, domainmask_ds, margin, out_path):
+    """Shrink a 0/1 mask by `margin` metres, but only against in-domain pixels.
+
+    Pixels outside the domain mask count as inside while eroding, so the
+    boundary does not move where the domain is cut at the data edge (the open
+    ocean mouth) -- only where it meets land or too-shallow water.
+    """
+    m = mask_ds.ReadAsArray() > 0
+    outside = domainmask_ds.ReadAsArray() != 1
+    k = int(round(margin / abs(mask_ds.GetGeoTransform()[1])))
+    grow = m | outside
+    for _ in range(k):
+        e = grow.copy()
+        e[1:] &= grow[:-1]; e[:-1] &= grow[1:]
+        e[:, 1:] &= grow[:, :-1]; e[:, :-1] &= grow[:, 1:]
+        grow = e
+    eroded = (grow & m).astype(np.uint8)
+    drv = gdal.GetDriverByName("GTiff")
+    ds = drv.Create(out_path, eroded.shape[1], eroded.shape[0], 1, gdal.GDT_Byte)
+    ds.SetGeoTransform(mask_ds.GetGeoTransform())
+    ds.SetProjection(mask_ds.GetProjection())
+    band = ds.GetRasterBand(1)
+    band.WriteArray(eroded)
+    band.SetNoDataValue(0)
+    ds.FlushCache()
+    print(f"[SHORELINE] margin {margin:g} m ({k} px): mask {int(m.sum())} -> "
+          f"{int(eroded.sum())} pixels", flush=True)
+    return ds
 
 
 def save_array_as_tiff(array, template_ds, out_path, dtype=gdal.GDT_Float32, nodata=None, compress=True): 
@@ -2287,33 +2627,101 @@ def save_array_as_tiff(array, template_ds, out_path, dtype=gdal.GDT_Float32, nod
     print(f"Saved GeoTIFF → {out_path}")
 
 class DraggablePolyline:
-    def __init__(self, ax, points):
+    """Interactive editor for a closed polygon.
+
+    Mouse / keys (with the toolbar's zoom and pan switched off):
+      left-drag a vertex   move it
+      i                    insert a vertex at the cursor, into the nearest edge
+      d                    delete the vertex nearest the cursor
+      u                    undo the last change
+      R                    reset to the automatic contour
+      close the window     accept and save
+    """
+
+    PICK_PIXELS = 10
+
+    def __init__(self, ax, points, automatic=None):
         self.ax = ax
         self.points = np.array(points, dtype=float)
-        self.line, = ax.plot(self.points[:,0], self.points[:,1], "r.-", ms=8, picker=5)
+        self.automatic = np.array(automatic if automatic is not None else points,
+                                  dtype=float)
+        self.history = []
         self.selected_index = None
+        self.line, = ax.plot([], [], "r.-", ms=7, lw=1.2, zorder=5)
+        self._redraw()
+        canvas = ax.figure.canvas
+        canvas.mpl_connect("button_press_event", self.on_press)
+        canvas.mpl_connect("button_release_event", self.on_release)
+        canvas.mpl_connect("motion_notify_event", self.on_motion)
+        canvas.mpl_connect("key_press_event", self.on_key)
 
-        self.cid_press = self.line.figure.canvas.mpl_connect("button_press_event", self.on_press)
-        self.cid_release = self.line.figure.canvas.mpl_connect("button_release_event", self.on_release)
-        self.cid_motion = self.line.figure.canvas.mpl_connect("motion_notify_event", self.on_motion)
+    # -- helpers --------------------------------------------------------------
+    def _redraw(self):
+        closed = np.vstack([self.points, self.points[:1]])
+        self.line.set_data(closed[:, 0], closed[:, 1])
+        self.ax.set_xlabel(f"{len(self.points)} vertices   |   drag  i:insert  "
+                           f"d:delete  u:undo  R:reset   |   close window to save")
+        self.ax.figure.canvas.draw_idle()
 
+    def _busy(self):
+        tb = getattr(self.ax.figure.canvas, "toolbar", None)
+        return bool(tb is not None and getattr(tb, "mode", ""))
+
+    def _nearest_vertex(self, event):
+        disp = self.ax.transData.transform(self.points)
+        d = np.hypot(disp[:, 0] - event.x, disp[:, 1] - event.y)
+        i = int(d.argmin())
+        return i, d[i]
+
+    def _push(self):
+        self.history.append(self.points.copy())
+
+    # -- events ---------------------------------------------------------------
     def on_press(self, event):
-        if event.inaxes != self.ax:
+        if event.inaxes != self.ax or event.button != 1 or self._busy():
             return
-        d = np.hypot(self.points[:,0] - event.xdata,
-                     self.points[:,1] - event.ydata)
-        if d.min() < 500:
-            self.selected_index = d.argmin()
+        i, d = self._nearest_vertex(event)
+        if d < self.PICK_PIXELS:
+            self._push()
+            self.selected_index = i
 
     def on_motion(self, event):
         if self.selected_index is None or event.inaxes != self.ax:
             return
         self.points[self.selected_index] = [event.xdata, event.ydata]
-        self.line.set_data(self.points[:,0], self.points[:,1])
-        self.line.figure.canvas.draw_idle()
+        self._redraw()
 
     def on_release(self, event):
         self.selected_index = None
+
+    def on_key(self, event):
+        if event.inaxes != self.ax and event.key not in ("u", "R"):
+            return
+        if event.key == "i":
+            p = np.array([event.xdata, event.ydata])
+            a, b = self.points, np.roll(self.points, -1, axis=0)
+            ab = b - a
+            t = np.clip(((p - a) * ab).sum(1) / np.maximum((ab ** 2).sum(1), 1e-12), 0, 1)
+            dist = np.hypot(*(a + t[:, None] * ab - p).T)
+            k = int(dist.argmin())
+            self._push()
+            self.points = np.insert(self.points, k + 1, p, axis=0)
+        elif event.key == "d":
+            if len(self.points) <= 3:
+                return
+            i, _ = self._nearest_vertex(event)
+            self._push()
+            self.points = np.delete(self.points, i, axis=0)
+        elif event.key == "u":
+            if not self.history:
+                return
+            self.points = self.history.pop()
+        elif event.key == "R":
+            self._push()
+            self.points = self.automatic.copy()
+        else:
+            return
+        self._redraw()
 
     def get_points(self):
         return self.points.tolist()
@@ -2353,19 +2761,64 @@ def PlotShoreOnRaster(line,extent,seathickness_array):
     plt.close('all')
 
 
-def Manual_Redraw(line,extent,seathickness_array):
-    fig, ax = plt.subplots(figsize=(10,10))
+def Manual_Redraw(line, extent, seathickness_array, ice_thickness=None,
+                  automatic=None, thresholds=None):
+    """Open the shoreline editor (blocking) and return the edited polygon.
 
-    im = ax.imshow(seathickness_array, extent=extent, cmap="viridis",vmin=0,vmax=100, origin="upper")
-    fig.colorbar(im, ax=ax)
+    The background is the water column; contours mark where it crosses the
+    open-water and under-ice thresholds, the white line is the ice outline and
+    the dashed grey line the automatic contour.
+    """
+    import os
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        raise RuntimeError("SHORELINE_EDIT=1 needs a display (no DISPLAY set)")
+    for backend in ("TkAgg", "QtAgg"):
+        try:
+            plt.switch_backend(backend)
+            break
+        except Exception:
+            continue
+    # 'r' would otherwise reset the view instead of being free for us
+    plt.rcParams["keymap.home"] = [k for k in plt.rcParams["keymap.home"]
+                                   if k != "r"]
 
-    editor = DraggablePolyline(ax, line)
+    fig, ax = plt.subplots(figsize=(11, 11))
+    water = np.where(np.isfinite(seathickness_array), seathickness_array, np.nan)
+    im = ax.imshow(water, extent=extent, cmap="viridis", vmin=0, vmax=200,
+                   origin="upper", interpolation="nearest")
+    fig.colorbar(im, ax=ax, shrink=0.7, label="water column (m)")
+    ny, nx = water.shape
+    xs = np.linspace(extent[0], extent[1], nx)
+    ys = np.linspace(extent[3], extent[2], ny)
+    if thresholds is not None:
+        t_open, t_shelf = thresholds
+        under_ice = (ice_thickness > 0) if ice_thickness is not None else np.zeros_like(water, bool)
+        ax.contour(xs, ys, np.where(under_ice, np.nan, water), [t_open],
+                   colors="orange", linewidths=0.8)
+        ax.contour(xs, ys, np.where(under_ice, water, np.nan), [t_shelf],
+                   colors="magenta", linewidths=0.8)
+    if ice_thickness is not None:
+        ax.contour(xs, ys, (ice_thickness > 0).astype(float), [0.5],
+                   colors="white", linewidths=0.8)
+    if automatic is not None:
+        auto = np.vstack([automatic, automatic[:1]])
+        ax.plot(auto[:, 0], auto[:, 1], "--", color="0.6", lw=0.8)
+    pts = np.asarray(line)
+    pad = 3000
+    ax.set_xlim(pts[:, 0].min() - pad, pts[:, 0].max() + pad)
+    ax.set_ylim(pts[:, 1].min() - pad, pts[:, 1].max() + pad)
+    ax.set_aspect("equal")
+    title = "Shoreline editor"
+    if thresholds is not None:
+        title += (f"   orange: {thresholds[0]:g} m (open water)   "
+                  f"magenta: {thresholds[1]:g} m (under ice)   white: ice edge")
+    ax.set_title(title, fontsize=9)
 
-    plt.title("Drag shoreline points and close window to save")
-    plt.close('all')
-
+    editor = DraggablePolyline(ax, line, automatic=automatic)
+    plt.show()          # blocks until the window is closed
     new_line = editor.get_points()
-
+    plt.close("all")
+    plt.switch_backend("Agg")
     return new_line
 
 
@@ -2479,7 +2932,7 @@ def _write_stacked_msh(sm, face_groups, output_path):
 
     try:
         xdmf_path = write_legacy_xdmf(output_path)
-        print(f"Wrote XDMF companion for FEniCS: {xdmf_path}")
+        print(f"Wrote XDMF for FEniCS/ParaView: {xdmf_path} (+ _volume.xdmf)")
     except Exception as err:
         print(f"[stacked] Failed to write XDMF next to {output_path}: {err}",
               file=sys.stderr)
@@ -2508,6 +2961,7 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
 
     xy = planar["xy"]
     tris = planar["tris"]
+    tri_is_ice = planar["tri_is_ice"]
     node_is_ice = planar["node_is_ice"]
     inflow_edges = planar["inflow_edges"]
 
@@ -2558,8 +3012,47 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
         print(f"[STACKED] MIN_LAYER_THICKNESS={MIN_LAYER_THICKNESS:g} m: "
               f"{int((layers < num_of_layers).sum())} of {C} columns get fewer "
               f"than {num_of_layers} layers (min {int(layers.min())})", flush=True)
+    front_kw = {}
+    if CALVING_FRONT:
+        # Front columns sit on the ice/water interface: used by both ice and
+        # open-water triangles.  They get extra layers from the sea surface
+        # down to the draft, so open water reaches z=0 right up to the front.
+        in_water = np.zeros(C, bool)
+        in_water[np.unique(tris[~tri_is_ice])] = True
+        draft = -z_top
+        front = node_is_ice & in_water & (draft >= MIN_FRONT_DRAFT)
+        if MIN_LAYER_THICKNESS > 0:
+            nu = np.clip(np.floor(draft / MIN_LAYER_THICKNESS), 1, num_of_layers)
+        else:
+            nu = np.clip(np.round(num_of_layers * draft / (draft + z_top - z_bot)),
+                         1, num_of_layers)
+        nu = np.where(front, nu, 0).astype(np.int64)
+        if layers is None:
+            layers = np.full(C, num_of_layers, np.int64)
+        front_kw = dict(tri_is_ice=tri_is_ice, z_surface=np.zeros(C),
+                        upper_layers=nu)
+        print(f"[STACKED] calving front: {int(front.sum())} front columns, draft "
+              f"{float(draft[front].min()) if front.any() else 0:.0f}-"
+              f"{float(draft[front].max()) if front.any() else 0:.0f} m, "
+              f"{int(nu[front].min()) if front.any() else 0}-"
+              f"{int(nu[front].max()) if front.any() else 0} layers above the draft",
+              flush=True)
+    if ICE_TOP_LAYER > 0:
+        if layers is None:
+            layers = np.full(C, num_of_layers, np.int64)
+        front_kw["top_layer"] = np.where(node_is_ice, ICE_TOP_LAYER, 0.0)
+        front_kw["max_growth"] = LAYER_GROWTH
+        if "tri_is_ice" not in front_kw:
+            front_kw["tri_is_ice"] = tri_is_ice
+        H = z_top - z_bot
+        stretched = node_is_ice & (H > layers * ICE_TOP_LAYER) & (layers >= 2)
+        print(f"[STACKED] stretching {int(stretched.sum())} of "
+              f"{int(node_is_ice.sum())} ice columns: top layer "
+              f"{ICE_TOP_LAYER:g} m, growth <= {LAYER_GROWTH:g}", flush=True)
     sm = build_stacked_volume(xy, tris, scale * z_top, scale * z_bot,
-                              num_of_layers, layers_per_column=layers)
+                              num_of_layers, layers_per_column=layers,
+                              **{k: (scale * v if k in ("z_surface", "top_layer") else v)
+                                 for k, v in front_kw.items()})
     L = sm.num_layers
 
     # --- classify the derived boundary into physical groups ------------------
@@ -2568,8 +3061,12 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
     is_bottom = sm.boundary_kind == BOTTOM
     is_side = sm.boundary_kind == SIDE
 
-    ice_face = is_top & np.all(node_is_ice[cols], axis=1)
+    if sm.boundary_from_ice is not None:
+        ice_face = is_top & sm.boundary_from_ice
+    else:
+        ice_face = is_top & np.all(node_is_ice[cols], axis=1)
     water_face = is_top & ~ice_face
+    calving_face = sm.boundary_kind == CALVING
 
     side_idx = np.flatnonzero(is_side)
     inflow_side, wall_side = [], []
@@ -2577,8 +3074,9 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
         edge = frozenset(int(c) for c in cols[i])
         (inflow_side if edge in inflow_edges else wall_side).append(i)
 
+    ice_faces = ice_face | (calving_face & (CALVING_FRONT_TAG == ICE_TAG))
     face_groups = [
-        (ICE_TAG, "Ice", sm.boundary_faces[ice_face]),
+        (ICE_TAG, "Ice", sm.boundary_faces[ice_faces]),
         (WATER_SURFACE_TAG, "Water Surface", sm.boundary_faces[water_face]),
         (BATHYMETRY_TAG, "Bathymetry",
          np.concatenate([sm.boundary_faces[is_bottom],
@@ -2586,6 +3084,11 @@ def generate_stacked_mesh(outline, intersect, grounding_line, m, eps,
          if wall_side else sm.boundary_faces[is_bottom]),
         (INFLOW_TAG, "Inflow", sm.boundary_faces[inflow_side]),
     ]
+    if CALVING_FRONT_TAG != ICE_TAG:
+        face_groups.append((CALVING_FRONT_TAG, "Calving front",
+                            sm.boundary_faces[calving_face]))
+    print(f"[STACKED] calving front: {int(calving_face.sum())} faces -> tag "
+          f"{CALVING_FRONT_TAG}", flush=True)
 
     output_path = ensure_msh_path(mesh_filename or
                                   f"stacked_layers{num_of_layers}.msh")
@@ -2630,28 +3133,44 @@ def main():
         categories_path="../data/gis_data/categories.tif",
         domainmask_path="new_data/domainmask.tif",
         shoreline_res=shoreline_res,
+        thickness_path="../data/thickness.tif",
+        shelf_min_thickness=SHELF_MIN_THICKNESS,
+        margin=SHORELINE_MARGIN,
+        gl_tolerance=SHORELINE_GL_TOL,
+        tolerance=SHORELINE_TOL,
     )
 
     extent=ComputeSpaceExtent(surface_pos_data,seathickness_array)
 
-    # Cache is keyed on SHORELINE_MIN_THICKNESS: the saved boundary is only
-    # valid for the threshold it was derived with, so a different threshold
-    # gets its own file rather than silently reusing the old shoreline.
+    # Cache is keyed on the thresholds and resolution: the saved boundary is
+    # only valid for the settings it was derived with, so different settings
+    # get their own file rather than silently reusing the old shoreline.  A
+    # hand-edited polygon (SHORELINE_EDIT=1) is saved into the same file.
+    import json
     _saved_shore = Path(f"new_data/saved_shoreline_t{SHORELINE_MIN_THICKNESS:g}"
+                        + ("" if SHELF_MIN_THICKNESS == SHORELINE_MIN_THICKNESS
+                           else f"_s{SHELF_MIN_THICKNESS:g}")
                         + ("" if shoreline_res == 30 else f"_r{shoreline_res:g}")
+                        + (f"_m{SHORELINE_MARGIN:g}" if SHORELINE_MARGIN > 0 else "")
+                        + (f"_g{SHORELINE_GL_TOL:g}o{SHORELINE_TOL:g}"
+                           if SHORELINE_GL_TOL > 0 else "")
                         + ".json")
+    automatic = shoreline
     if _saved_shore.exists():
-        import json
         shoreline = json.loads(_saved_shore.read_text())
         print(f"[SHORELINE] Loaded saved boundary from {_saved_shore}  "
-              f"(delete this file to re-draw)")
-    else:
-        new_shoreline = Manual_Redraw(shoreline, extent, seathickness_array)
-        shoreline = new_shoreline
-        import json
+              f"(delete this file to re-draw, SHORELINE_EDIT=1 to edit)")
+    if SHORELINE_EDIT:
+        thickness_array = thickness_data.ReadAsArray()
+        shoreline = Manual_Redraw(shoreline, extent, seathickness_array,
+                                  ice_thickness=thickness_array,
+                                  automatic=automatic,
+                                  thresholds=(SHORELINE_MIN_THICKNESS,
+                                              SHELF_MIN_THICKNESS))
+    if SHORELINE_EDIT or not _saved_shore.exists():
         _saved_shore.parent.mkdir(parents=True, exist_ok=True)
         _saved_shore.write_text(json.dumps(shoreline))
-        print(f"[SHORELINE] Saved boundary to {_saved_shore}")
+        print(f"[SHORELINE] Saved boundary ({len(shoreline)} points) to {_saved_shore}")
 
     categories = readraster('../data/gis_data/categories.tif')
 
@@ -2691,6 +3210,8 @@ def main():
     water_line = get_main_boundary(water_lines)
 
     intersect = get_water_ice_intersect(water_line, seaice_line)
+    if SHORELINE_GL_TOL > 0:
+        outline, intersect = clip_front_to_outline(outline, intersect)
     
     all_lines = {'Main Outline': outline, 'Grounding Line': grounding_line, 
                 'Water-Ice Intersect': intersect}
@@ -2741,15 +3262,23 @@ def main():
     # SHORELINE_MIN_THICKNESS, minimum water column from MIN_WATER_COLUMN (all
     # env vars). The output filename encodes all three so runs at different
     # settings never overwrite each other.
-    _n_layers = int(os.environ.get("NUM_LAYERS", 15))
-    _element_size = float(os.environ.get("ELEMENT_SIZE", 2000))
+    _n_layers = int(os.environ.get("NUM_LAYERS", 38))
+    _element_size = float(os.environ.get("ELEMENT_SIZE", 500))
+    # Vertical exaggeration written into the mesh coordinates.  1 = real
+    # coordinates, which the solver needs; 6 was the old default.
+    _z_scale = float(os.environ.get("Z_SCALE", 1))
     sweep = [
-        Scenario(_element_size, 6, _n_layers, False, False, 0,
+        Scenario(_element_size, _z_scale, _n_layers, False, False, 0,
                  ("stacked" if USE_STACKED else "sweep")
                  + f"_layers{_n_layers}_t{SHORELINE_MIN_THICKNESS:g}"
+                 + ("" if SHELF_MIN_THICKNESS == SHORELINE_MIN_THICKNESS
+                    else f"_s{SHELF_MIN_THICKNESS:g}")
                  + f"_c{MIN_WATER_COLUMN:g}_h{_element_size:g}"
                  + ("" if SHORELINE_RES == 30 else f"_r{SHORELINE_RES}")
-                 + (f"_dz{MIN_LAYER_THICKNESS:g}" if MIN_LAYER_THICKNESS > 0 else "")
+                 + (f"_m{SHORELINE_MARGIN:g}" if SHORELINE_MARGIN > 0 else "")
+                 + ("" if _z_scale == 1 else f"_zx{_z_scale:g}")
+                 + (f"_dz{MIN_LAYER_THICKNESS:g}" if USE_STACKED and MIN_LAYER_THICKNESS > 0 else "")
+                 + (f"_top{ICE_TOP_LAYER:g}" if USE_STACKED and ICE_TOP_LAYER > 0 else "")
                  + ".msh"),
     ]
 

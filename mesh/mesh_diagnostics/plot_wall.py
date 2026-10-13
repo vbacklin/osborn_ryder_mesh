@@ -3,7 +3,7 @@ mesh into a flat strip: x = distance along the boundary, y = z (unscaled).
 Shows how many vertical levels each wall column carries.
 
 usage: python mesh_diagnostics/plot_wall.py OUT.png MESH.msh [MESH2.msh ...]
-       [--scale 6] [--range S0 S1]   (S in km along the boundary)
+       [--scale 1] [--range S0 S1]   (S in km along the boundary)
 """
 import sys
 import numpy as np
@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 
 args = sys.argv[1:]
-scale, srange = 6.0, None
+scale, srange = 1.0, None
 if "--scale" in args:
     i = args.index("--scale"); scale = float(args[i + 1]); del args[i:i + 2]
 if "--range" in args:

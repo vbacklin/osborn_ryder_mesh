@@ -4,7 +4,8 @@ Run: python -u test_stacked_volume.py
 """
 import numpy as np
 from stacked_volume import (build_stacked_volume, split_prism_to_tets,
-                            layers_from_min_thickness, TOP, BOTTOM, SIDE)
+                            layers_from_min_thickness, stretched_fractions,
+                            TOP, BOTTOM, SIDE, CALVING)
 
 FAIL = []
 
@@ -298,6 +299,140 @@ for bad, label in ((np.zeros(len(xy), np.int64), "0 layers"),
         check(f"{label} raises", True)
 check("layers_from_min_thickness clips to [1, L]",
       list(layers_from_min_thickness([0.5, 25, 1e6], 38, 5.0)) == [1, 5, 38])
+
+# --- 7. vertical calving front ----------------------------------------------
+def verify_front(name, xy, tris, ice_tri, draft, z_bot, L, n, nu_val):
+    print(f"\n--- {name} ---")
+    C = len(xy)
+    in_ice = np.zeros(C, bool); in_ice[np.unique(tris[ice_tri])] = True
+    in_wat = np.zeros(C, bool); in_wat[np.unique(tris[~ice_tri])] = True
+    front = in_ice & in_wat
+    z_top = np.where(in_ice, draft, 0.0)
+    nu = np.where(front, nu_val, 0)
+    m = build_stacked_volume(xy, tris, z_top, z_bot, L, layers_per_column=n,
+                             tri_is_ice=ice_tri, z_surface=np.zeros(C),
+                             upper_layers=nu)
+    vols = tet_volumes(m.coords, m.tets)
+    check("all tets strictly positive volume", np.all(vols > 0), f"min {vols.min():.4g}")
+    # water prisms reach the surface (0) at every column, ice prisms the draft
+    top_t = np.where(ice_tri[:, None], z_top[tris], 0.0)
+    analytic = float(np.sum(tri_area(xy, tris) * (top_t.mean(1) - z_bot[tris].mean(1))))
+    rel = abs(vols.sum() - analytic) / analytic
+    check("total volume == analytic (water to surface, ice to draft)", rel < 1e-10,
+          f"rel err {rel:.2e}")
+    faces = np.concatenate([m.tets[:, [0, 2, 1]], m.tets[:, [0, 1, 3]],
+                            m.tets[:, [0, 3, 2]], m.tets[:, [1, 2, 3]]])
+    _, cnt = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
+    check("every face used once or twice", set(np.unique(cnt)) <= {1, 2})
+    be = np.concatenate([m.boundary_faces[:, [0, 1]], m.boundary_faces[:, [1, 2]],
+                         m.boundary_faces[:, [2, 0]]])
+    _, ecnt = np.unique(np.sort(be, axis=1), axis=0, return_counts=True)
+    check("boundary surface is closed", np.all(ecnt == 2))
+    _, dcnt = np.unique(be, axis=0, return_counts=True)
+    check("boundary orientation consistent", np.all(dcnt == 1))
+    k = m.boundary_kind
+    top_ice = (k == TOP) & m.boundary_from_ice
+    top_wat = (k == TOP) & ~m.boundary_from_ice
+    check("ice top faces == ice triangles", top_ice.sum() == ice_tri.sum())
+    check("water top faces == water triangles", top_wat.sum() == (~ice_tri).sum())
+    check("water tops sit at the surface",
+          np.allclose(m.coords[m.boundary_faces[top_wat]][..., 2], 0.0))
+    check("ice tops sit on the draft",
+          np.allclose(m.coords[m.boundary_faces[top_ice]][..., 2],
+                      z_top[m.node_col[m.boundary_faces[top_ice]]]))
+    # front edges: interior plan edges between an ice and a water triangle
+    e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+    owner = np.tile(np.arange(len(tris)), 3)
+    ek = [tuple(sorted(x)) for x in e.tolist()]
+    by = {}
+    for key_, t in zip(ek, owner):
+        by.setdefault(key_, []).append(t)
+    fe = [key_ for key_, ts in by.items() if len(ts) == 2 and ice_tri[ts[0]] != ice_tri[ts[1]]]
+    want = int(sum(nu[a] + nu[b] for a, b in fe))
+    calv = m.boundary_faces[k == CALVING]
+    check("calving faces == sum over front edges of both columns' upper layers",
+          len(calv) == want, f"{len(calv)} vs {want} on {len(fe)} front edges")
+    cxy = m.coords[calv][..., :2]
+    vert = np.abs(np.cross(cxy[:, 1] - cxy[:, 0], cxy[:, 2] - cxy[:, 0])) < 1e-6
+    check("calving faces are vertical", bool(vert.all()))
+    zc = m.coords[calv][..., 2]
+    dr = z_top[m.node_col[calv]]
+    check("calving faces span sea surface to draft only",
+          bool(np.all(zc <= 1e-9) and np.all(zc >= dr - 1e-9)))
+    check("calving face count > 0", len(calv) > 0)
+    return m
+
+
+rng = np.random.default_rng(7)
+cent = xy[tris].mean(1)
+ice_tri = cent[:, 0] < 2600 + 300 * np.sin(cent[:, 1] / 700)
+draft = -60 - 0.01 * xy[:, 1]
+zb = -400 - 0.05 * xy[:, 0] + rng.normal(0, 4, len(xy))
+verify_front("calving front, uniform 20 layers below, 3 above", xy, tris, ice_tri,
+             draft, zb, 20, np.full(len(xy), 20), 3)
+verify_front("calving front, random layers, 1 above", xy, tris, ice_tri, draft, zb,
+             38, rng.integers(1, 39, len(xy)), 1)
+verify_front("calving front, permuted indices", xy[perm], inv_perm[tris], ice_tri,
+             draft[perm], zb[perm], 38, rng.integers(1, 39, len(xy)), 4)
+try:
+    ice_u = utris.shape[0] and (upts[utris].mean(1)[:, 0] < 3000)
+    verify_front("calving front on unstructured gmsh mesh", upts, utris, ice_u,
+                 -50 - 0.005 * upts[:, 1], -260 - 0.03 * upts[:, 0], 38,
+                 rng.integers(3, 39, len(upts)), 5)
+except NameError:
+    pass
+
+# --- 8. vertical stretching toward the ice base ------------------------------
+def verify_stretch(name, xy, tris, ice_tri, draft, z_bot, L, n, nu_val, top):
+    print(f"\n--- {name} ---")
+    C = len(xy)
+    in_ice = np.zeros(C, bool); in_ice[np.unique(tris[ice_tri])] = True
+    in_wat = np.zeros(C, bool); in_wat[np.unique(tris[~ice_tri])] = True
+    front = in_ice & in_wat
+    z_top = np.where(in_ice, draft, 0.0)
+    nu = np.where(front, nu_val, 0)
+    tl = np.where(in_ice, top, 0.0)
+    m = build_stacked_volume(xy, tris, z_top, z_bot, L, layers_per_column=n,
+                             tri_is_ice=ice_tri, z_surface=np.zeros(C),
+                             upper_layers=nu, top_layer=tl)
+    vols = tet_volumes(m.coords, m.tets)
+    check("all tets strictly positive volume", np.all(vols > 0), f"min {vols.min():.4g}")
+    top_t = np.where(ice_tri[:, None], z_top[tris], 0.0)
+    analytic = float(np.sum(tri_area(xy, tris) * (top_t.mean(1) - z_bot[tris].mean(1))))
+    rel = abs(vols.sum() - analytic) / analytic
+    check("total volume unchanged by stretching", rel < 1e-10, f"rel err {rel:.2e}")
+    faces = np.concatenate([m.tets[:, [0, 2, 1]], m.tets[:, [0, 1, 3]],
+                            m.tets[:, [0, 3, 2]], m.tets[:, [1, 2, 3]]])
+    _, cnt = np.unique(np.sort(faces, axis=1), axis=0, return_counts=True)
+    check("every face used once or twice", set(np.unique(cnt)) <= {1, 2})
+    ok_first, ok_growth, ok_order, n_str = True, True, True, 0
+    for c in range(C):
+        z = m.coords[m.node_col == c][:, 2]
+        lower = z[nu[c]:]
+        dz = -np.diff(lower)
+        ok_order &= bool(np.all(-np.diff(z) > 0))
+        if in_ice[c] and (z_top[c] - z_bot[c]) > n[c] * top and n[c] >= 2:
+            n_str += 1
+            ok_growth &= bool(np.all(dz[1:] / dz[:-1] <= 1.2 + 1e-9))
+            ok_first &= bool(dz[0] >= top - 1e-6)
+            if dz[1] / dz[0] < 1.2 - 1e-6:
+                ok_first &= bool(abs(dz[0] - top) < 1e-6)
+    check("levels strictly ordered top to floor in every column", ok_order)
+    check(f"first ice layer == target unless growth cap binds ({n_str} cols)", ok_first)
+    check("layer growth factor <= 1.2", ok_growth)
+    return m
+
+
+rng = np.random.default_rng(11)
+verify_stretch("stretched, 38 layers, 5 m top", xy, tris, ice_tri, draft, zb, 38,
+               np.full(len(xy), 38), 3, 5.0)
+verify_stretch("stretched, random layers, permuted", xy[perm], inv_perm[tris], ice_tri,
+               draft[perm], zb[perm], 38, rng.integers(1, 39, len(xy)), 2, 3.0)
+fr = stretched_fractions(38, 700.0, 5.0)
+check("stretched_fractions: 0..1, first layer 5 m of 700",
+      fr[0] == 0 and abs(fr[-1] - 1) < 1e-12 and abs(fr[1] * 700 - 5) < 1e-6)
+check("stretched_fractions: thin column stays uniform",
+      np.allclose(stretched_fractions(10, 40.0, 5.0), np.linspace(0, 1, 11)))
 
 print("\n" + ("ALL CHECKS PASSED" if not FAIL else f"{len(FAIL)} FAILURES: {FAIL}"))
 raise SystemExit(1 if FAIL else 0)

@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["split_prism_to_tets", "sweep_prism_to_tets", "build_stacked_volume",
+__all__ = ["split_prism_to_tets", "sweep_prism_to_tets", "build_stacked_volume", "CALVING",
+           "stretched_fractions",
            "layers_from_min_thickness", "StackedMesh"]
 
 
@@ -115,10 +116,12 @@ class StackedMesh:
     """
 
     __slots__ = ("coords", "tets", "boundary_faces", "boundary_kind",
-                 "num_layers", "num_columns", "node_col", "node_level", "layers")
+                 "num_layers", "num_columns", "node_col", "node_level", "layers",
+                 "boundary_from_ice")
 
     def __init__(self, coords, tets, boundary_faces, boundary_kind,
-                 num_layers, num_columns, node_col, node_level, layers):
+                 num_layers, num_columns, node_col, node_level, layers,
+                 boundary_from_ice=None):
         self.coords = coords
         self.tets = tets
         self.boundary_faces = boundary_faces
@@ -128,6 +131,9 @@ class StackedMesh:
         self.node_col = node_col
         self.node_level = node_level
         self.layers = layers
+        # For each boundary face: True if it belongs to an ice prism (only set
+        # when build_stacked_volume was given tri_is_ice).
+        self.boundary_from_ice = boundary_from_ice
 
     def faces_of(self, kind):
         return self.boundary_faces[self.boundary_kind == kind]
@@ -137,6 +143,7 @@ class StackedMesh:
 TOP = 0      # sea surface or ice draft
 BOTTOM = 1   # sea floor
 SIDE = 2     # vertical wall (shoreline or inflow)
+CALVING = 3  # vertical ice front: sea surface down to the ice draft
 
 
 def _derive_boundary(tets):
@@ -163,7 +170,9 @@ def _derive_boundary(tets):
 
 
 def build_stacked_volume(xy, tris, z_top, z_bot, num_layers,
-                         layers_per_column=None):
+                         layers_per_column=None, tri_is_ice=None,
+                         z_surface=None, upper_layers=None,
+                         top_layer=None, max_growth=1.2):
     """Stack a plan-view triangulation into a layered tetrahedral volume.
 
     Parameters
@@ -184,6 +193,19 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers,
         split with sweep_prism_to_tets so neighbouring columns may differ;
         when omitted every column gets `num_layers` and the original
         diagonal-rule split is used unchanged.
+    top_layer : (C,) float, optional
+        Vertical stretching.  Where top_layer[c] > 0 and the column is thick
+        enough, its (lower-part) layers grow geometrically from top_layer[c]
+        at the top (ice base) to the floor, instead of being evenly spaced.
+        Only node heights change; the topology is the same.
+    tri_is_ice, z_surface, upper_layers : optional
+        Vertical calving front.  `tri_is_ice` (T,) marks plan triangles under
+        ice.  A column with `upper_layers[c] > 0` is a *front* column: it
+        carries extra nodes from `z_surface[c]` (sea surface) down to
+        `z_top[c]` (ice draft) in `upper_layers[c]` layers.  Open-water prisms
+        use the whole front column; ice prisms only the part below the draft.
+        Between two front columns the part above the draft is then a vertical
+        boundary face, classified CALVING.
 
     Returns
     -------
@@ -214,9 +236,13 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers,
             f"(min {worst:.6g}). Clamp the floor or clip the domain before "
             "stacking -- this construction will not hide a degenerate column.")
 
+    if (tri_is_ice is not None or top_layer is not None) and layers_per_column is None:
+        layers_per_column = np.full(C, L, np.int64)
     if layers_per_column is not None:
         return _build_variable(xy, tris, z_top, z_bot, L,
-                               np.asarray(layers_per_column, np.int64))
+                               np.asarray(layers_per_column, np.int64),
+                               tri_is_ice, z_surface, upper_layers, top_layer,
+                               max_growth)
 
     # --- nodes: regular (column, level) grid, level 0 at the top -------------
     sigma = np.linspace(0.0, 1.0, L + 1)                 # (L+1,)
@@ -267,44 +293,143 @@ def build_stacked_volume(xy, tris, z_top, z_bot, num_layers,
                        np.full(C, L, np.int64))
 
 
-def _build_variable(xy, tris, z_top, z_bot, L, n):
+def stretched_fractions(n, thickness, top, max_growth=1.2):
+    """Level depths as fractions of the column, top (0) to floor (1).
+
+    The first layer is `top` thick and each layer below is a constant factor
+    r >= 1 thicker, r chosen so the n layers fill `thickness` exactly.  r is
+    capped at `max_growth`; where the cap binds, the first layer comes out
+    thicker than `top` instead.  A column with thickness <= n * top stays
+    uniform.
+    """
+    if top <= 0 or thickness <= n * top or n < 2:
+        return np.linspace(0.0, 1.0, n + 1)
+    target = thickness / top                     # sum_{k<n} r^k = target
+    geo = lambda r: (r ** n - 1) / (r - 1)
+    if geo(max_growth) <= target:
+        r = max_growth
+    else:
+        lo, hi = 1.0, max_growth
+        for _ in range(100):
+            r = 0.5 * (lo + hi)
+            (lo, hi) = (r, hi) if geo(r) < target else (lo, r)
+        r = 0.5 * (lo + hi)
+    dz = r ** np.arange(n)
+    f = np.concatenate([[0.0], np.cumsum(dz)])
+    return f / f[-1]
+
+
+def _build_variable(xy, tris, z_top, z_bot, L, n, tri_is_ice=None,
+                    z_surface=None, upper_layers=None, top_layer=None,
+                    max_growth=1.2):
     C = len(xy)
+    T = len(tris)
     if n.shape != (C,):
         raise ValueError("layers_per_column must be (C,)")
     if n.min() < 1 or n.max() > L:
         raise ValueError(f"layers_per_column must lie in [1, {L}], "
                          f"got [{n.min()}, {n.max()}]")
+    ice_tri = (np.zeros(T, bool) if tri_is_ice is None
+               else np.asarray(tri_is_ice, bool))
+    nu = (np.zeros(C, np.int64) if upper_layers is None
+          else np.asarray(upper_layers, np.int64))
+    if ice_tri.shape != (T,) or nu.shape != (C,) or nu.min() < 0:
+        raise ValueError("tri_is_ice must be (T,), upper_layers (C,) and >= 0")
+    front = nu > 0
+    if front.any():
+        if z_surface is None:
+            raise ValueError("upper_layers needs z_surface")
+        z_surface = np.asarray(z_surface, float)
+        if not np.all(z_surface[front] > z_top[front]):
+            raise ValueError("front columns need z_surface above the ice draft")
     thickness = z_top - z_bot
 
-    off = np.concatenate([[0], np.cumsum(n + 1)])
-    node_col = np.repeat(np.arange(C), n + 1)
+    # Column c holds nu[c] upper layers (surface -> draft) above n[c] lower
+    # layers (draft -> floor).  The node at index nu[c] is the draft (or the
+    # top, for a column without an upper part).
+    per = n + 1 + nu
+    off = np.concatenate([[0], np.cumsum(per)])
+    node_col = np.repeat(np.arange(C), per)
     node_level = np.arange(off[-1]) - off[node_col]
-    sig = node_level / n[node_col]
-    coords = np.column_stack([xy[node_col, 0], xy[node_col, 1],
-                              z_top[node_col] - sig * thickness[node_col]])
-    sigmas = [sig[off[c]:off[c + 1]] for c in range(C)]
-    ids = [np.arange(off[c], off[c + 1]) for c in range(C)]
+    k = node_level - nu[node_col]               # <0 upper, 0 draft, >0 lower
+    up = k < 0
+    # Sweep key: upper part in [-1, 0), draft 0, lower part sigma in (0, 1].
+    key = np.where(up, k / np.maximum(nu[node_col], 1), k / n[node_col])
+    depth_frac = np.where(up, 0.0, key)
+    if top_layer is not None:
+        top_layer = np.asarray(top_layer, float)
+        for c in np.flatnonzero(top_layer > 0):
+            lo = off[c] + nu[c]
+            depth_frac[lo:off[c + 1]] = stretched_fractions(
+                int(n[c]), float(thickness[c]), float(top_layer[c]), max_growth)
+    z = z_top[node_col] - depth_frac * thickness[node_col]
+    if front.any():
+        zs = np.where(front, z_surface, z_top)
+        z = np.where(up, z_top[node_col] + (-key) * (zs - z_top)[node_col], z)
+    coords = np.column_stack([xy[node_col, 0], xy[node_col, 1], z])
 
-    tets = []
-    for tri in tris:
+    full_ids = [np.arange(off[c], off[c + 1]) for c in range(C)]
+    low_ids = [np.arange(off[c] + nu[c], off[c + 1]) for c in range(C)]
+
+    tets, owner = [], []
+    for t, tri in enumerate(tris):
         cols = (int(tri[0]), int(tri[1]), int(tri[2]))
-        tets.extend(sweep_prism_to_tets(cols, [ids[c] for c in cols],
-                                        [sigmas[c] for c in cols]))
+        lists = [low_ids[c] if ice_tri[t] else full_ids[c] for c in cols]
+        new = sweep_prism_to_tets(cols, lists, [key[l] for l in lists])
+        tets.extend(new)
+        owner.extend([t] * len(new))
     tets = np.asarray(tets, np.int64)
+    owner = np.asarray(owner, np.int64)
 
     p = coords[tets]
     vol = np.einsum('ij,ij->i',
                     np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]),
                     p[:, 3] - p[:, 0]) / 6.0
     if not np.all(np.abs(vol) > 0):
-        raise ValueError(f"{int((vol == 0).sum())} tets have zero volume")
+        bad_t = np.unique(owner[vol == 0])
+        q = xy[tris[bad_t]]
+        area = 0.5 * np.abs((q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+                            - (q[:, 2, 0] - q[:, 0, 0]) * (q[:, 1, 1] - q[:, 0, 1]))
+        raise ValueError(
+            f"{int((vol == 0).sum())} tets have zero volume, in plan triangles "
+            f"{bad_t[:10].tolist()} (plan areas {np.round(area[:10], 3).tolist()}, "
+            f"centroids {np.round(q.mean(1)[:3]).tolist()})")
     flip = vol < 0
     tets[flip] = tets[flip][:, [0, 2, 1, 3]]
 
-    bfaces = _derive_boundary(tets)
-    lvl = node_level[bfaces]
-    bottom_lvl = n[node_col[bfaces]]
+    bfaces, bowner = _derive_boundary_with_owner(tets)
+    fcol = node_col[bfaces]
+    bottom = np.all(node_level[bfaces] == (per - 1)[fcol], axis=1)
+    ncols = np.array([len(set(r)) for r in fcol.tolist()])
     kind = np.full(bfaces.shape[0], SIDE, dtype=np.int8)
-    kind[np.all(lvl == 0, axis=1)] = TOP
-    kind[np.all(lvl == bottom_lvl, axis=1)] = BOTTOM
-    return StackedMesh(coords, tets, bfaces, kind, L, C, node_col, node_level, n)
+    kind[(ncols == 3) & bottom] = BOTTOM
+    kind[(ncols == 3) & ~bottom] = TOP
+    if front.any():
+        # Side faces lying wholly in the upper part, across a plan edge that
+        # is interior (shared by two triangles), are the calving front.
+        e = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]],
+                                    tris[:, [2, 0]]]), axis=1)
+        ue, cnt = np.unique(e, axis=0, return_counts=True)
+        interior = {tuple(x) for x in ue[cnt == 2].tolist()}
+        upper_face = np.all(k[bfaces] <= 0, axis=1) & np.any(k[bfaces] < 0, axis=1)
+        for i in np.flatnonzero((kind == SIDE) & upper_face):
+            pair = tuple(sorted(set(fcol[i].tolist())))
+            if pair in interior:
+                kind[i] = CALVING
+    from_ice = ice_tri[owner[bowner]] if tri_is_ice is not None else None
+    return StackedMesh(coords, tets, bfaces, kind, L, C, node_col, node_level, n,
+                       from_ice)
+
+
+def _derive_boundary_with_owner(tets):
+    """Like _derive_boundary, but also return the owning tet of each face."""
+    faces = np.concatenate([tets[:, [0, 2, 1]], tets[:, [0, 1, 3]],
+                            tets[:, [0, 3, 2]], tets[:, [1, 2, 3]]])
+    owner = np.tile(np.arange(len(tets)), 4)
+    _, first, counts = np.unique(np.sort(faces, axis=1), axis=0,
+                                 return_index=True, return_counts=True)
+    if (counts > 2).any():
+        raise ValueError(f"{int((counts > 2).sum())} faces are shared by more "
+                         "than two tets -- the prism split is not conforming")
+    keep = first[counts == 1]
+    return faces[keep], owner[keep]
