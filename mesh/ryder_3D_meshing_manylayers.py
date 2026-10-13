@@ -126,6 +126,16 @@ MIN_LAYER_THICKNESS = float(os.environ.get("MIN_LAYER_THICKNESS", 10.0))
 ICE_TOP_LAYER = float(os.environ.get("ICE_TOP_LAYER", 5.0))
 LAYER_GROWTH = float(os.environ.get("LAYER_GROWTH", 1.2))
 
+# Horizontal refinement of the plan-view mesh (stacked path).  Under the ice
+# the triangles are ICE_ELEMENT_SIZE, along the grounding line (outline walls
+# around the ice) GL_ELEMENT_SIZE, and both grow back to ELEMENT_SIZE over
+# SIZE_GRADING m -- from the grounding line, and from the ice front into open
+# water.  0 for the two sizes means h/2 and h/4.  HORIZONTAL_REFINE=0: uniform.
+HORIZONTAL_REFINE = int(os.environ.get("HORIZONTAL_REFINE", 1))
+ICE_ELEMENT_SIZE = float(os.environ.get("ICE_ELEMENT_SIZE", 0))
+GL_ELEMENT_SIZE = float(os.environ.get("GL_ELEMENT_SIZE", 0))
+SIZE_GRADING = float(os.environ.get("SIZE_GRADING", 3000.0))
+
 WATER_SURFACE_TAG = 5
 ICE_TAG = 1
 BATHYMETRY_TAG = 2
@@ -1412,7 +1422,48 @@ def generate_2D_mesh(outline, intersect, grounding_line, category_data,
 
     model.geo.synchronize()
 
-    if boundary_curve_tags:
+    if planar_only and delta is None and HORIZONTAL_REFINE:
+        h_open = float(m)
+        h_ice = ICE_ELEMENT_SIZE or h_open / 2
+        h_gl = GL_ELEMENT_SIZE or h_open / 4
+        inflow_tags = {tag for _, tag in inflow_lines}
+        gl_curves = [c for c in outer_part if abs(c) not in inflow_tags]
+        front_curves = list(lines_interface)
+        fa = gmsh.model.mesh.field
+
+        ice_const = fa.add("Constant")
+        fa.setNumber(ice_const, "VIn", h_ice)
+        fa.setNumber(ice_const, "VOut", 1e22)
+        fa.setNumbers(ice_const, "SurfacesList", ice)
+        fa.setNumber(ice_const, "IncludeBoundary", 1)
+
+        def graded(curves, size):
+            d = fa.add("Distance")
+            fa.setNumbers(d, "CurvesList", sorted(abs(c) for c in curves))
+            fa.setNumber(d, "Sampling", BOUNDARY_FIELD_SAMPLING)
+            t = fa.add("Threshold")
+            fa.setNumber(t, "InField", d)
+            fa.setNumber(t, "SizeMin", size)
+            fa.setNumber(t, "SizeMax", h_open)
+            fa.setNumber(t, "DistMin", 0.0)
+            fa.setNumber(t, "DistMax", SIZE_GRADING)
+            return t
+
+        parts = [ice_const, graded(front_curves, h_ice)]
+        if gl_curves:
+            parts.append(graded(gl_curves, h_gl))
+        fmin = fa.add("Min")
+        fa.setNumbers(fmin, "FieldsList", parts)
+        fa.setAsBackgroundMesh(fmin)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthFromPoints", 0)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 0)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 0)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", h_open)
+        print(f"[PLANAR] horizontal refinement: open water {h_open:g} m, under ice "
+              f"{h_ice:g} m, grounding line {h_gl:g} m, grading over "
+              f"{SIZE_GRADING:g} m ({len(gl_curves)} grounding-line curves, "
+              f"{len(front_curves)} front curves)", flush=True)
+    elif boundary_curve_tags:
         field_api = gmsh.model.mesh.field
         distance_field = field_api.add("Distance")
         field_api.setNumbers(distance_field, "CurvesList", sorted(boundary_curve_tags))
@@ -3279,6 +3330,9 @@ def main():
                  + ("" if _z_scale == 1 else f"_zx{_z_scale:g}")
                  + (f"_dz{MIN_LAYER_THICKNESS:g}" if USE_STACKED and MIN_LAYER_THICKNESS > 0 else "")
                  + (f"_top{ICE_TOP_LAYER:g}" if USE_STACKED and ICE_TOP_LAYER > 0 else "")
+                 + ((f"_hr{ICE_ELEMENT_SIZE or _element_size / 2:g}"
+                     f"-{GL_ELEMENT_SIZE or _element_size / 4:g}")
+                    if USE_STACKED and HORIZONTAL_REFINE else "")
                  + ".msh"),
     ]
 
